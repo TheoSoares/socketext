@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SockeText</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <div class="chat-wrapper">
+
+    <div class="chat-header">
+      <div class="header-logo">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+          <path d="M10 2L12.5 7.5H18L13.5 11L15.5 17L10 13.5L4.5 17L6.5 11L2 7.5H7.5L10 2Z" fill="currentColor"/>
+        </svg>
+      </div>
+      <div class="header-info">
+        <span class="header-name">SockeText</span>
+        <span class="header-status">
+          <span class="status-dot" id="statusDot"></span>
+          <span id="statusLabel">ao vivo</span>
+        </span>
+      </div>
+    </div>
+
+    <div class="chat-messages" id="messages" role="log" aria-live="polite" aria-label="Mensagens do chat">
+      <div class="date-divider"><span>Hoje</span></div>
+    </div>
+
+    <div class="chat-footer">
+      <div class="input-row" id="inputRow">
+        <textarea
+          class="msg-input"
+          id="msgInput"
+          placeholder="Mensagem..."
+          rows="1"
+          aria-label="Escreva sua mensagem"
+        ></textarea>
+        <button class="send-btn" id="sendBtn" aria-label="Enviar mensagem">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M14 8L2 2L5 8L2 14L14 8Z" fill="currentColor"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
