@@ -224,7 +224,7 @@
   // socket.addEventListener("close", () => {
   //   SockeText.setStatus("offline");
   // });
-  //
+  // 
   // socket.addEventListener("message", (event) => {
   //   const data = JSON.parse(event.data);
   //   if (data.type === "typing") {
