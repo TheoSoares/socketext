@@ -126,6 +126,7 @@ PORT=5000
 |---|---|
 | `SECRET_KEY` | Mesma chave usada no backend (para sessões Flask) |
 | `SOCKET_SERVERS` | Lista de URLs dos servidores WebSocket, separadas por vírgula |
+| `PORT` | Porta em que o servidor WebSocket irá escutar (ex: `8000`) |
 
 **Exemplo:**
 ```env
