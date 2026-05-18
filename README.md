@@ -9,13 +9,15 @@ Construído com **Flask + Flask-SocketIO** no backend, **Flask** no frontend e *
 ## Arquitetura
 
 ```
-frontend/          → Cliente Flask (porta 8000)
+frontend/          → Cliente Flask (porta definida por PORT)
 │  client.py       → Rotas HTTP (login, chat)
+│  requirements.txt
 │  templates/      → HTML (login.html, chat.html)
 │  static/         → JS e CSS da interface
 │
-backend/           → Servidor WebSocket (porta 5000+)
+backend/           → Servidor WebSocket (porta definida por PORT)
 │  server.py       → SocketIO: histórico, mensagens, typing
+│  requirements.txt
 ```
 
 A comunicação entre frontend e backend acontece via **WebSocket (Socket.IO)**. O frontend tenta se conectar a cada servidor listado em `SOCKET_SERVERS` em sequência, reconectando automaticamente em caso de queda.
@@ -55,13 +57,13 @@ cd socketext
 **Backend:**
 ```bash
 cd backend
-pip install flask flask-socketio flask-sqlalchemy psycopg2-binary python-dotenv
+pip install -r requirements.txt
 ```
 
 **Frontend:**
 ```bash
 cd frontend
-pip install flask python-dotenv
+pip install -r requirements.txt
 ```
 
 ### 3. Configure os arquivos `.env`
@@ -81,12 +83,20 @@ CREATE TABLE messages (
 
 ### 5. Inicie os servidores
 
+**Backend** (produção com Gunicorn + gevent):
 ```bash
-# Terminal 1 — backend
+cd backend
+gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:$PORT server:app
+```
+
+**Backend** (desenvolvimento local):
+```bash
 cd backend
 python server.py
+```
 
-# Terminal 2 — frontend
+**Frontend:**
+```bash
 cd frontend
 python client.py
 ```
@@ -126,7 +136,7 @@ PORT=5000
 |---|---|
 | `SECRET_KEY` | Mesma chave usada no backend (para sessões Flask) |
 | `SOCKET_SERVERS` | Lista de URLs dos servidores WebSocket, separadas por vírgula |
-| `PORT` | Porta em que o servidor WebSocket irá escutar (ex: `8000`) |
+| `PORT` | Porta em que o frontend irá escutar (ex: `8000`) |
 
 **Exemplo:**
 ```env
@@ -139,18 +149,41 @@ O frontend tenta conectar aos servidores na ordem listada. Se o primeiro falhar,
 
 ---
 
+## Deploy no Render
+
+### Backend
+
+1. **New → Web Service**, conecte ao repositório
+2. **Root Directory:** `backend`
+3. **Build Command:** `pip install -r requirements.txt`
+4. **Start Command:**
+   ```bash
+   gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:$PORT server:app
+   ```
+5. Em **Environment Variables**, adicione as variáveis do `backend/.env`. O Render injeta `PORT` automaticamente — não é necessário definir manualmente.
+
+### Frontend
+
+1. **New → Web Service**, conecte ao repositório
+2. **Root Directory:** `frontend`
+3. **Build Command:** `pip install -r requirements.txt`
+4. **Start Command:** `python client.py`
+5. Em **Environment Variables**, adicione as variáveis do `frontend/.env`. Em `SOCKET_SERVERS`, use a URL pública gerada pelo Render para cada instância do backend (ex: `https://socketext-backend.onrender.com`).
+
+> O `-w 1` no Gunicorn é obrigatório com WebSockets — múltiplos workers quebrariam as conexões persistentes. Para escalar, suba múltiplos serviços apontando para o mesmo Redis.
+
+---
+
 ## Rodando múltiplas instâncias do backend
 
-Para escalar horizontalmente, rode várias instâncias do `server.py` em portas diferentes. Todas devem apontar para o **mesmo Redis** — ele garante que as mensagens sejam entregues a todos os clientes, independentemente de qual instância eles estejam conectados.
-
-Defina `PORT` no `.env` de cada instância e suba normalmente. Em ambientes onde só existe um `.env`, você pode sobrescrever a variável na linha de comando:
+Todas as instâncias devem apontar para o **mesmo Redis** — ele sincroniza as mensagens entre elas independentemente de qual instância o cliente estiver conectado.
 
 ```bash
 # Instância 1 (usa PORT=5000 do .env)
-python server.py
+gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:$PORT server:app
 
 # Instância 2
-PORT=5001 python server.py
+PORT=5001 gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:$PORT server:app
 ```
 
 Liste todas as URLs no `SOCKET_SERVERS` do frontend.
@@ -163,9 +196,11 @@ Liste todas as URLs no `SOCKET_SERVERS` do frontend.
 socketext/
 ├── backend/
 │   ├── server.py
+│   ├── requirements.txt
 │   └── .env
 ├── frontend/
 │   ├── client.py
+│   ├── requirements.txt
 │   ├── .env
 │   ├── templates/
 │   │   ├── login.html
