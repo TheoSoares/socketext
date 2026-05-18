@@ -9,7 +9,7 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY')
-socketio = SocketIO(app, cors_allowed_origins='*', message_queue=os.environ.get('REDIS_URL'))
+socketio = SocketIO(app, cors_allowed_origins='*', message_queue=os.environ.get('REDIS_URL'), async_mode='gevent')
 
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('EXTERNAL_DATABASE_URL') if DEBUG else os.environ.get('INTERNAL_DATABASE_URL')
