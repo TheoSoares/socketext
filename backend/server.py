@@ -44,4 +44,4 @@ def handle_message(data: str) -> None:
     return None
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=os.getenv('PORT'))
+    socketio.run(app, host='0.0.0.0', port=os.getenv('PORT'), allow_unsafe_werkzeug=True)
