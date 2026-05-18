@@ -132,6 +132,7 @@ PORT=5000
 ```env
 SECRET_KEY=troque-por-uma-chave-segura-e-aleatoria
 SOCKET_SERVERS=http://192.168.1.10:5000,http://192.168.1.10:5001
+PORT=8000
 ```
 
 O frontend tenta conectar aos servidores na ordem listada. Se o primeiro falhar, tenta o próximo automaticamente.
