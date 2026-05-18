@@ -1,274 +1,186 @@
 /**
- * SockeText — script.js
+ * script.js — Lógica do cliente web do SockeText.
  *
- * Gerencia a interface (UI) e a comunicação com o Web Worker
- * (socket.worker.js) que roda em thread separada.
- *
- * Thread principal  → UI + envio de comandos ao worker
- * socket.worker.js  → thread dedicada à recepção de mensagens WebSocket
+ * Responsabilidades:
+ *   - Conectar ao frontend Flask via Socket.IO.
+ *   - Enviar mensagens e sinalizar digitação.
+ *   - Renderizar mensagens, histórico e notificações do sistema.
+ *   - Gerenciar indicador de "digitando...".
  */
 
-(function () {
-  /* ── Referências DOM ── */
-  const messagesEl  = document.getElementById("messages");
-  const inputEl     = document.getElementById("msgInput");
-  const sendBtn     = document.getElementById("sendBtn");
-  const statusDot   = document.getElementById("statusDot");
-  const statusLabel = document.getElementById("statusLabel");
+"use strict";
 
-  /* ── Estado ── */
-  let typingRow     = null;
-  let typingTimeout = null;
-  let isTyping      = false;
-  let workerReady   = false;   // true quando o worker confirmou conexão
+// ---------------------------------------------------------------------------
+// Conexão Socket.IO
+// ---------------------------------------------------------------------------
 
-  /* ── Fila de mensagens e worker de intervalo ── */
-  let messagesQueue = [];
-  let queueWorker   = null;
+const socket = io({ transports: ["websocket"] });
 
-  /* ────────────────────────────────────────────
-     WEB WORKER — thread dedicada à recepção
-     O Worker roda em thread separada do browser.
-     Toda comunicação é via postMessage / onmessage.
-  ──────────────────────────────────────────── */
-  const socketWorker = new Worker(
-    window.WORKER_URL || "/static/socket.worker.js"
-  );
+// ---------------------------------------------------------------------------
+// Referências DOM
+// ---------------------------------------------------------------------------
 
-  /* Inicia a conexão dentro do worker assim que o script carrega */
-  socketWorker.postMessage({ cmd: 'connect', servers: SERVERS });
+const messagesList = document.getElementById("messages");
+const messageInput = document.getElementById("message-input");
+const sendBtn      = document.getElementById("send-btn");
+const typingEl     = document.getElementById("typing-indicator");
 
-  /* Recebe eventos do worker (roda na thread principal, mas a lógica de
-     socket fica completamente encapsulada na thread do worker) */
-  socketWorker.onmessage = function (e) {
-    const msg = e.data;
+// ---------------------------------------------------------------------------
+// Estado local
+// ---------------------------------------------------------------------------
 
-    switch (msg.event) {
+/** Usuários digitando no momento: Set<string> */
+const typingUsers = new Set();
 
-      case 'status':
-        setConnectionStatus(msg.state);
-        if (msg.state === 'online')  workerReady = true;
-        if (msg.state === 'offline') workerReady = false;
-        // Processa fila quando ficar online
-        if (msg.state === 'online' && messagesQueue.length > 0) processMessage();
-        break;
+/** Timer para parar de sinalizar "digitando" após inatividade */
+let typingTimer = null;
 
-      case 'history_load':
-        handleHistoryLoad(msg.data);
-        break;
+// ---------------------------------------------------------------------------
+// Renderização
+// ---------------------------------------------------------------------------
 
-      case 'message':
-        handleIncomingMessage(msg.data);
-        break;
+/**
+ * Cria e insere uma bolha de mensagem na lista.
+ *
+ * @param {string} username
+ * @param {string} text
+ * @param {string} [sentAt]   - Timestamp ISO opcional.
+ * @param {boolean} [isOwn]   - True se é mensagem do próprio usuário.
+ */
+function appendMessage(username, text, sentAt = "", isOwn = false) {
+  const time = sentAt
+    ? new Date(sentAt).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })
+    : new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
 
-      case 'log':
-        console.log('[Worker]', msg.text);
-        break;
-    }
-  };
+  const item = document.createElement("div");
+  item.classList.add("msg", isOwn ? "msg--own" : "msg--other");
 
-  socketWorker.onerror = function (err) {
-    console.error('[Worker] Erro não tratado:', err);
-  };
+  item.innerHTML = `
+    <div class="msg__header">
+      <span class="msg__user">${escapeHtml(username)}</span>
+      <span class="msg__time">${time}</span>
+    </div>
+    <div class="msg__bubble">${escapeHtml(text)}</div>
+  `;
 
-  /* ── Helpers ── */
+  messagesList.appendChild(item);
+  scrollToBottom();
+}
 
-  function getTime() {
-    const d = new Date();
-    return d.getHours().toString().padStart(2, "0") + ":" +
-           d.getMinutes().toString().padStart(2, "0");
+/**
+ * Insere uma mensagem de sistema (entrada/saída, reconexão, etc.).
+ *
+ * @param {string} text
+ */
+function appendSystemMessage(text) {
+  const item = document.createElement("div");
+  item.classList.add("msg", "msg--system");
+  item.innerHTML = `<div class="msg__bubble">${escapeHtml(text)}</div>`;
+  messagesList.appendChild(item);
+  scrollToBottom();
+}
+
+/** Rola a lista para o final. */
+function scrollToBottom() {
+  messagesList.scrollTop = messagesList.scrollHeight;
+}
+
+/**
+ * Escapa caracteres HTML para evitar XSS.
+ *
+ * @param {string} str
+ * @returns {string}
+ */
+function escapeHtml(str) {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// ---------------------------------------------------------------------------
+// Indicador de digitação
+// ---------------------------------------------------------------------------
+
+/** Atualiza o texto do indicador com base em typingUsers. */
+function updateTypingIndicator() {
+  const users = [...typingUsers].filter(u => u !== window.CURRENT_USER);
+
+  if (users.length === 0) {
+    typingEl.hidden = true;
+    typingEl.textContent = "";
+    return;
   }
 
-  function scrollToBottom() {
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-  }
+  typingEl.hidden = false;
+  typingEl.textContent =
+    users.length === 1
+      ? `${users[0]} está digitando…`
+      : `${users.join(", ")} estão digitando…`;
+}
 
-  function escapeHTML(str) {
-    return str
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
-  }
+// ---------------------------------------------------------------------------
+// Eventos Socket.IO — recepção
+// ---------------------------------------------------------------------------
 
-  /* ── Renderização de mensagens ── */
-
-  function addMessage({ direction, text, sender = "", time }) {
-    removeTypingIndicator();
-
-    const row = document.createElement("div");
-    row.className = `msg-row ${direction}`;
-
-    let senderHTML = "";
-    if (direction === "incoming" && sender) {
-      senderHTML = `<div class="msg-sender">${escapeHTML(sender)}</div>`;
-    }
-
-    row.innerHTML = `
-      ${senderHTML}
-      <div class="msg-bubble">${escapeHTML(text)}</div>
-      <div class="msg-time">${time || getTime()}</div>
-    `;
-
-    messagesEl.appendChild(row);
-    scrollToBottom();
-    return row;
-  }
-
-  function removeAllMessages() {
-    messagesEl.replaceChildren();
-  }
-
-  /* ── Indicador de digitação ── */
-
-  function showTypingIndicator(sender) {
-    removeTypingIndicator();
-    const row = document.createElement("div");
-    row.className = "msg-row incoming";
-    const senderHTML = sender
-      ? `<div class="msg-sender">${escapeHTML(sender)}</div>`
-      : "";
-    row.innerHTML = `
-      ${senderHTML}
-      <div class="typing-indicator">
-        <div class="typing-dot"></div>
-        <div class="typing-dot"></div>
-        <div class="typing-dot"></div>
-      </div>
-    `;
-    typingRow = row;
-    messagesEl.appendChild(row);
-    scrollToBottom();
-  }
-
-  function removeTypingIndicator() {
-    if (typingRow) { typingRow.remove(); typingRow = null; }
-  }
-
-  /* ── Status de conexão ── */
-
-  function setConnectionStatus(state) {
-    const colors = { online: "#3fcf8e", offline: "#e24b4a", connecting: "#EF9F27" };
-    const labels = { online: "ao vivo",  offline: "desconectado", connecting: "conectando..." };
-    statusDot.style.background = colors[state] || colors.online;
-    statusLabel.textContent    = labels[state]  || state;
-  }
-
-  /* ── Handlers de eventos vindos do worker ── */
-
-  function handleHistoryLoad(data) {
-    const pending = [...messagesQueue];
-    removeAllMessages();
-
-    data.forEach(element => {
-      if (element.sender === NAME) {
-        addMessage({ direction: "outgoing", text: element.text, time: element.time });
-      } else {
-        addMessage({ direction: "incoming", sender: element.sender, text: element.text, time: element.time });
-      }
-    });
-
-    messagesQueue = [];
-    pending.forEach(item => {
-      const newRow = addMessage({ direction: "outgoing", text: item.data.text });
-      newRow.style.opacity = "0.5";
-      messagesQueue.push({ data: item.data, uiRow: newRow });
-    });
-
-    if (messagesQueue.length > 0) processMessage();
-  }
-
-  function handleIncomingMessage(data) {
-    if (data.type === 'typing') {
-      showTypingIndicator(data.sender);
-    } else if (data.type === 'stop_typing') {
-      removeTypingIndicator();
-    } else if (data.type === 'message') {
-      addMessage({ direction: "incoming", sender: data.sender, text: data.text });
-    }
-  }
-
-  /* ── Envio de mensagem ── */
-
-  function sendMessage() {
-    const text = inputEl.value.trim();
-    if (!text) return;
-
-    if (isTyping) {
-      clearTimeout(typingTimeout);
-      typingTimeout = null;
-      isTyping = false;
-      if (workerReady) {
-        socketWorker.postMessage({ cmd: 'send', data: { type: "stop_typing", sender: NAME } });
-      }
-    }
-
-    const messageRow = addMessage({ direction: "outgoing", text });
-    inputEl.value = "";
-    inputEl.style.height = "auto";
-
-    messagesQueue.push({
-      data:   { type: "message", sender: NAME, text },
-      uiRow:  messageRow
-    });
-    messageRow.style.opacity = "0.5";
-    processMessage();
-  }
-
-  function processMessage() {
-    if (queueWorker !== null) return;
-
-    queueWorker = setInterval(() => {
-      if (messagesQueue.length === 0) {
-        clearInterval(queueWorker);
-        queueWorker = null;
-        return;
-      }
-      if (workerReady) {
-        const item = messagesQueue.shift();
-        // Envia pelo worker (que tem acesso ao socket na sua thread)
-        socketWorker.postMessage({ cmd: 'send', data: item.data });
-        item.uiRow.style.opacity = "1";
-      }
-    }, 200);   // intervalo reduzido: 200 ms (antes 2000) — a fila serve para ordem, não delay
-  }
-
-  /* ── Indicador de digitação (envio) ── */
-
-  function handleTyping() {
-    if (!workerReady) return;
-
-    if (!isTyping) {
-      isTyping = true;
-      socketWorker.postMessage({ cmd: 'send', data: { type: "typing", sender: NAME } });
-    }
-
-    clearTimeout(typingTimeout);
-    typingTimeout = setTimeout(() => {
-      isTyping = false;
-      if (workerReady) {
-        socketWorker.postMessage({ cmd: 'send', data: { type: "stop_typing", sender: NAME } });
-      }
-    }, 2000);
-  }
-
-  /* ── Eventos do input ── */
-
-  inputEl.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
+socket.on("history", ({ messages }) => {
+  messages.forEach(({ username, text, sent_at }) => {
+    appendMessage(username, text, sent_at, username === window.CURRENT_USER);
   });
+});
 
-  inputEl.addEventListener("input", function () {
-    this.style.height = "auto";
-    this.style.height = Math.min(this.scrollHeight, 100) + "px";
-    handleTyping();
-  });
+socket.on("message", ({ username, text, sent_at }) => {
+  appendMessage(username, text, sent_at, username === window.CURRENT_USER);
+  typingUsers.delete(username);
+  updateTypingIndicator();
+});
 
-  inputEl.addEventListener("keyup",          handleTyping);
-  inputEl.addEventListener("compositionend", handleTyping);
-  sendBtn.addEventListener("click",          sendMessage);
+socket.on("system", ({ text }) => {
+  appendSystemMessage(text);
+});
 
-})();
+socket.on("typing", ({ username, typing }) => {
+  if (typing) {
+    typingUsers.add(username);
+  } else {
+    typingUsers.delete(username);
+  }
+  updateTypingIndicator();
+});
+
+// ---------------------------------------------------------------------------
+// Envio
+// ---------------------------------------------------------------------------
+
+function sendMessage() {
+  const text = messageInput.value.trim();
+  if (!text) return;
+
+  socket.emit("send_message", { text });
+  messageInput.value = "";
+
+  clearTimeout(typingTimer);
+  socket.emit("typing", { typing: false });
+}
+
+sendBtn.addEventListener("click", sendMessage);
+
+messageInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Sinalização de digitação
+// ---------------------------------------------------------------------------
+
+messageInput.addEventListener("input", () => {
+  socket.emit("typing", { typing: true });
+  clearTimeout(typingTimer);
+  typingTimer = setTimeout(() => {
+    socket.emit("typing", { typing: false });
+  }, 2000);
+});
