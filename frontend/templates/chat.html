@@ -4,7 +4,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SockeText</title>
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href={{ url_for('static', filename='style.css') }} />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script> <!--SocketIO Library Load-->
+  <script>
+    const SERVERS = {{ servers | tojson }};
+    const NAME = {{ name | tojson }}
+  </script>
 </head>
 <body>
 
@@ -47,7 +52,7 @@
     </div>
 
   </div>
-
-  <script src="script.js"></script>
+  
+  <script src="{{ url_for('static', filename='script.js') }}"></script>
 </body>
 </html>

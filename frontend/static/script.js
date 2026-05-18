@@ -8,8 +8,6 @@
  */
 
 (function () {
-  "use strict";
-
   /* ── Referências DOM ── */
   const messagesEl = document.getElementById("messages");
   const inputEl    = document.getElementById("msgInput");
@@ -19,6 +17,8 @@
 
   /* ── Estado ── */
   let typingRow = null; // linha do indicador de digitação
+  let typingTimeout = null;
+  let isTyping = false;
 
 
   /* ── Helpers ── */
@@ -76,6 +76,11 @@
     return row;
   }
 
+
+  /* ── Resetar todas mensagens após um reconnect ── */
+  function removeAllMessages() {
+    messagesEl.replaceChildren(); 
+  }
 
   /* ── Indicador de digitação ── */
 
@@ -137,27 +142,75 @@
   /* ── Envio de mensagem (interface) ── */
 
   function sendMessage() {
-    const text = inputEl.value.trim();
-    if (!text) return;
+  const text = inputEl.value.trim();
+  if (!text) return;
 
-    // Exibe a mensagem localmente como "outgoing"
-    addMessage({ direction: "outgoing", text });
-
-    // Limpa o campo de entrada
-    inputEl.value = "";
-    inputEl.style.height = "auto";
-
-    // [SOCKET] Aqui você envia a mensagem para o servidor:
-    // socket.send(JSON.stringify({ type: "message", text }));
+  // só avisa o servidor se estava digitando de fato
+  if (isTyping) {
+    clearTimeout(typingTimeout);
+    typingTimeout = null;
+    isTyping = false;
+    if (socket && socket.connected) {
+      socket.emit("message", { type: "stop_typing", sender: NAME });
+    }
   }
 
+  const messageRow = addMessage({ direction: "outgoing", text });
+
+  inputEl.value = "";
+  inputEl.style.height = "auto";
+
+  messagesQueue.push({
+    data: { type: "message", sender: NAME, text: text },
+    uiRow: messageRow
+  });
+
+  messageRow.style.opacity = "0.5";
+  processMessage();
+}
+  
+  function processMessage() {
+    if (queueWorker !== null) return;
+    
+    queueWorker = setInterval(() => {
+      if (messagesQueue.length === 0) {
+        clearInterval(queueWorker)
+        queueWorker = null;
+        return;
+      }
+
+      if (socket && socket.connected) {
+        const actualMessage = messagesQueue.shift();
+
+        socket.emit('message', actualMessage.data);
+        actualMessage.uiRow.style.opacity = "1";
+      }
+    }, 2000)
+
+  };
+
+  /* ── Fila de mensagens para garantir ordem de envio ── */
+  let messagesQueue = []
+  let queueWorker = null
 
   /* ── Auto-resize do textarea ── */
 
-  inputEl.addEventListener("input", function () {
-    this.style.height = "auto";
-    this.style.height = Math.min(this.scrollHeight, 100) + "px";
-  });
+  function handleTyping() {
+    if (socket && socket.connected) {
+      if (!isTyping) {
+        isTyping = true;
+        socket.emit("message", { type: "typing", sender: NAME });
+      }
+
+      clearTimeout(typingTimeout);
+      typingTimeout = setTimeout(() => {
+        isTyping = false;
+        if (socket && socket.connected) {
+          socket.emit("message", { type: "stop_typing", sender: NAME });
+        }
+      }, 2000);
+    }
+  }
 
   inputEl.addEventListener("keydown", function (e) {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -165,6 +218,14 @@
       sendMessage();
     }
   });
+
+  inputEl.addEventListener("input", () => {
+    this.style.height = "auto";
+    this.style.height = Math.min(this.scrollHeight, 100) + "px";
+    handleTyping();
+  });
+  inputEl.addEventListener("keyup", handleTyping);
+  inputEl.addEventListener("compositionend", handleTyping);
 
   sendBtn.addEventListener("click", sendMessage);
 
@@ -187,6 +248,13 @@
      */
     receive(opts) {
       addMessage({ direction: "incoming", ...opts });
+    },
+
+    /**
+     * Remove todas mensagens antigas para atualizar tela.
+     */
+    clearMessages() {
+      removeAllMessages();
     },
 
     /**
@@ -213,25 +281,90 @@
     },
   };
 
-  // [SOCKET] Exemplo de integração WebSocket:
-  //
-  // const socket = new WebSocket("wss://seu-servidor.com/chat");
-  //
-  // socket.addEventListener("open", () => {
-  //   SockeText.setStatus("online");
-  // });
-  //
-  // socket.addEventListener("close", () => {
-  //   SockeText.setStatus("offline");
-  // });
-  // 
-  // socket.addEventListener("message", (event) => {
-  //   const data = JSON.parse(event.data);
-  //   if (data.type === "typing") {
-  //     SockeText.showTyping(data.sender);
-  //   } else if (data.type === "message") {
-  //     SockeText.receive({ sender: data.sender, text: data.text });
-  //   }
-  // });
+  function tryConnect(index = 0) { 
+    if (index >= SERVERS.length) {
+      console.error("Nenhum servidor disponível");
+      setTimeout(() => {
+        tryConnect()
+        console.log('Waiting 2 seconds before trying to find servers...');
+      }, 2000)
+      return;
+    }
 
+    const server = SERVERS[index];
+
+    socket = io(server, {
+      timeout: 1000,
+      reconnection: false
+    });
+
+    socket.on("connect", () => {
+
+      console.log("Conectado:", server);
+
+      SockeText.setStatus("online");
+      
+    });
+    
+    socket.on("connect_error", () => {
+      
+      console.log("Falhou:", server);
+      
+      SockeText.setStatus("offline");
+      
+      socket.disconnect();
+      
+      tryConnect(index + 1);
+      
+    });
+    
+    socket.on('history_load', (data) => {
+      const pending = [...messagesQueue];
+
+      SockeText.clearMessages()
+      data.forEach(element => {
+        if (element.sender === NAME) {
+          addMessage({ direction: "outgoing", text: element.text, time: element.time });
+        }
+        else {
+          SockeText.receive({ sender: element.sender, text: element.text, time: element.time });
+        }
+      });
+
+      messagesQueue = [];
+      pending.forEach(item => {
+        const newRow = addMessage({ direction: "outgoing", text: item.data.text });
+        newRow.style.opacity = "0.5";
+        messagesQueue.push({ data: item.data, uiRow: newRow });
+      });
+
+      if (messagesQueue.length > 0) processMessage();
+    });
+
+    socket.on('message', (data) => {
+      if (data.type === 'typing') {
+        SockeText.showTyping(data.sender);
+      } else if (data.type === 'stop_typing') {
+        SockeText.hideTyping();
+      } else if (data.type === 'message') {
+        SockeText.receive({ sender: data.sender, text: data.text });
+      }
+    });
+  
+    socket.on('disconnect', (reason) => {
+      console.log('Desconectado do servidor! Motivo: ', reason)
+
+      if (queueWorker !== null) {
+        clearInterval(queueWorker);
+        queueWorker = null;
+      }
+      tryConnect()
+    });
+  };
+  
+  // [SOCKET] Exemplo de integração WebSocket:
+  
+  var socket = null;
+
+  tryConnect();
 })();
