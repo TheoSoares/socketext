@@ -12,7 +12,6 @@ app.secret_key = os.environ.get('SECRET_KEY')
 socketio = SocketIO(app, cors_allowed_origins='*', message_queue=os.environ.get('REDIS_URL'))
 
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-DEBUG = False
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('EXTERNAL_DATABASE_URL') if DEBUG else os.environ.get('INTERNAL_DATABASE_URL')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
