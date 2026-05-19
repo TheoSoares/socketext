@@ -83,8 +83,8 @@ def _client_worker(sid: str, msg_queue: queue.Queue) -> None:
             print(f'[{thread_name}] Processando mensagem: {data}')
 
             if data['type'] in ('typing', 'stop_typing'):
-                # CORREÇÃO: Mudado include_self=False para skip_sid=sid
-                socketio.emit('message', data, skip_sid=sid, broadcast=True)
+                # CORREÇÃO: Removido 'broadcast=True'
+                socketio.emit('message', data, skip_sid=sid)
                 continue
 
             with app.app_context():
@@ -97,8 +97,8 @@ def _client_worker(sid: str, msg_queue: queue.Queue) -> None:
                 )
                 db.session.commit()
 
-            # CORREÇÃO: Mudado include_self=False para skip_sid=sid
-            socketio.emit('message', data, skip_sid=sid, broadcast=True)
+            # CORREÇÃO: Removido 'broadcast=True'
+            socketio.emit('message', data, skip_sid=sid)
 
     print(f'[{thread_name}] Thread encerrada.')
 
