@@ -1,180 +1,354 @@
 """
-server.py — Servidor principal do SockeText.
+SockeText — Backend
+Servidor WebSocket puro usando a biblioteca `websockets` + threading.
 
-Responsabilidades:
-  - Aceitar conexões WebSocket de browsers via Flask-SocketIO.
-  - Usar Redis como message_queue para sincronizar múltiplas instâncias:
-    mensagens emitidas em um servidor chegam a clientes conectados nos demais.
-  - Gerenciar threads manualmente: uma Thread dedicada por cliente conectado,
-    responsável por carregar histórico e processar mensagens sem bloquear
-    o loop principal do SocketIO.
-  - Persistir e carregar histórico via PostgreSQL.
+Arquitetura de threads:
+  - Thread HTTP        → Flask serve /history e /health
+  - Thread WS-Server   → websockets.sync.server aceita conexões
+  - Thread por cliente → handle_client() — uma thread dedicada por conexão
+  - Thread Replicação  → primário mantém WS com réplica (replication_connector)
+  - Thread Monitor     → réplica detecta queda do primário (primary_monitor)
+
+Tolerância a falhas:
+  - Primário envia {"type":"__primary__"} ao conectar na réplica.
+  - Réplica detecta queda pelo fechamento da conexão e assume como nó ativo.
+  - Frontend tenta servidores em sequência; reconecta automaticamente.
 """
 
 import os
+import json
 import threading
+import time
 import logging
+from datetime import datetime
 
-from flask import Flask, request
-from flask_socketio import SocketIO, emit
+from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
 from dotenv import load_dotenv
 
-# ---------------------------------------------------------------------------
-# Configuração
-# ---------------------------------------------------------------------------
+import websockets.sync.server as ws_sync
+import websockets.sync.client as ws_client_sync
 
 load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(threadName)s — %(message)s",
 )
 log = logging.getLogger(__name__)
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY")
+# ── Configuração ──────────────────────────────────────────────────────────────
 
-# Redis como message_queue: garante que mensagens emitidas em uma instância
-# sejam entregues a clientes conectados em outras instâncias do servidor.
-# async_mode="threading" substitui gevent — threads gerenciadas manualmente.
-socketio = SocketIO(
-    app,
-    cors_allowed_origins="*",
-    message_queue=os.environ.get("REDIS_URL"),
-    async_mode="threading",
+IS_REPLICA      = os.getenv("IS_REPLICA", "false").lower() == "true"
+WS_HOST         = os.getenv("WS_HOST", "0.0.0.0")
+WS_PORT         = int(os.getenv("WS_PORT", 9000))
+HTTP_PORT       = int(os.getenv("HTTP_PORT", 5000))
+REPLICA_WS_HOST = os.getenv("REPLICA_WS_HOST", "127.0.0.1")
+REPLICA_WS_PORT = int(os.getenv("REPLICA_WS_PORT", 9001))
+DEBUG_MODE      = os.getenv("DEBUG", "false").lower() == "true"
+
+# ── Flask / DB ────────────────────────────────────────────────────────────────
+
+flask_app = Flask(__name__)
+flask_app.secret_key = os.getenv("SECRET_KEY", "dev-secret")
+flask_app.config["SQLALCHEMY_DATABASE_URI"] = (
+    os.getenv("EXTERNAL_DATABASE_URL") if DEBUG_MODE
+    else os.getenv("INTERNAL_DATABASE_URL")
 )
+flask_app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+db = SQLAlchemy(flask_app)
 
-DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-app.config["SQLALCHEMY_DATABASE_URI"] = (
-    os.environ.get("EXTERNAL_DATABASE_URL")
-    if DEBUG
-    else os.environ.get("INTERNAL_DATABASE_URL")
-)
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+@flask_app.route("/history")
+def route_history():
+    with flask_app.app_context():
+        rows = db.session.execute(
+            text("SELECT username, sent_at, message FROM messages ORDER BY sent_at")
+        ).fetchall()
+    return jsonify([
+        {"sender": r[0], "time": r[1].strftime("%H:%M"), "text": r[2]}
+        for r in rows
+    ])
 
-db = SQLAlchemy(app)
+@flask_app.route("/health")
+def route_health():
+    return jsonify({"ok": True, "replica": IS_REPLICA, "wsPort": WS_PORT})
 
-# ---------------------------------------------------------------------------
-# Banco de dados
-# ---------------------------------------------------------------------------
+# ── Estado global compartilhado entre threads ─────────────────────────────────
 
-def load_history() -> list[dict]:
-    """Retorna todas as mensagens do banco em ordem cronológica."""
-    sql = text("SELECT username, sent_at, message FROM messages ORDER BY sent_at")
-    with app.app_context():
-        result = db.session.execute(sql)
+clients: dict = {}       # sid -> websocket connection
+clients_lock  = threading.Lock()
+client_counter = 0
+counter_lock   = threading.Lock()
+
+replica_ws   = None      # conexão com a réplica (usado pelo primário)
+replica_lock = threading.Lock()
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _send(ws, payload: dict) -> bool:
+    try:
+        ws.send(json.dumps(payload, ensure_ascii=False))
+        return True
+    except Exception:
+        return False
+
+def broadcast(payload: dict, exclude: str = None):
+    with clients_lock:
+        snapshot = list(clients.items())
+    dead = []
+    for sid, ws in snapshot:
+        if sid == exclude:
+            continue
+        if not _send(ws, payload):
+            dead.append(sid)
+    for sid in dead:
+        _remove_client(sid)
+
+def _remove_client(sid: str):
+    with clients_lock:
+        ws = clients.pop(sid, None)
+    if ws:
+        log.info("Removido: %s", sid)
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+def forward_to_replica(payload: dict):
+    global replica_ws
+    with replica_lock:
+        rws = replica_ws
+    if rws is None:
+        return
+    try:
+        rws.send(json.dumps({"__replica__": True, **payload}, ensure_ascii=False))
+    except Exception as e:
+        log.warning("Falha ao replicar: %s", e)
+        with replica_lock:
+            replica_ws = None
+
+def load_history():
+    with flask_app.app_context():
+        rows = db.session.execute(
+            text("SELECT username, sent_at, message FROM messages ORDER BY sent_at")
+        ).fetchall()
         return [
-            {
-                "sender": row[0],
-                "time":   row[1].strftime("%H:%M"),
-                "text":   row[2],
-            }
-            for row in result
+            {"sender": r[0], "time": r[1].strftime("%H:%M"), "text": r[2]}
+            for r in rows
         ]
 
+def persist_message(sender: str, text_body: str):
+    with flask_app.app_context():
+        db.session.execute(
+            text("INSERT INTO messages (username, message) VALUES (:u, :m)"),
+            {"u": sender, "m": text_body},
+        )
+        db.session.commit()
 
-def save_message(username: str, message: str) -> None:
-    """Persiste uma mensagem no banco de dados."""
-    sql = text("INSERT INTO messages (username, message) VALUES (:username, :message)")
-    try:
-        with app.app_context():
-            db.session.execute(sql, {"username": username, "message": message})
-            db.session.commit()
-    except Exception as e:
-        log.error("Erro ao salvar mensagem: %s", e)
+# ── Processador de frames ─────────────────────────────────────────────────────
 
+def process_frame(msg: dict, sid: str):
+    """Processa um frame recebido de um cliente."""
+    mtype = msg.get("type")
 
-# ---------------------------------------------------------------------------
-# Threads dedicadas
-# ---------------------------------------------------------------------------
-
-def client_setup_thread(sid: str) -> None:
-    """
-    Thread dedicada ao setup de um novo cliente.
-
-    Carrega o histórico do banco (I/O potencialmente lento) e o envia
-    apenas para o cliente recém-conectado, sem bloquear o loop principal.
-
-    Args:
-        sid: ID da sessão SocketIO do cliente.
-    """
-    log.info("Thread de setup iniciada para sid '%s'.", sid[:8])
-    history = load_history()
-    socketio.emit("history_load", history, to=sid)
-    log.info("Histórico enviado para sid '%s' (%d msgs).", sid[:8], len(history))
-
-
-def handle_message_thread(data: dict) -> None:
-    """
-    Thread dedicada ao processamento de uma mensagem recebida.
-
-    Separa persistência e broadcast do loop de eventos, evitando que
-    operações de I/O (banco) bloqueiem outros clientes.
-
-    Args:
-        data: Dicionário com os dados da mensagem recebida.
-    """
-    msg_type = data.get("type")
-
-    if msg_type in ("typing", "stop_typing"):
-        # Repassa indicador de digitação sem persistir
-        socketio.emit("message", data, include_self=False)
+    if mtype in ("join", "__heartbeat__"):
         return
 
-    if msg_type == "message":
-        username = data.get("sender", "")
-        message  = data.get("text", "")
-        log.info("[%s] %s", username, message)
-        save_message(username, message)
-        # O Redis message_queue garante entrega às demais instâncias.
-        socketio.emit("message", data, include_self=False, broadcast=True)
+    if mtype in ("typing", "stop_typing"):
+        payload = {"type": mtype, "sender": msg.get("sender", "?")}
+        broadcast(payload, exclude=sid)
+        if not IS_REPLICA:
+            forward_to_replica(payload)
+        return
 
+    if mtype == "message":
+        text_body = msg.get("text", "").strip()
+        sender    = msg.get("sender", "Anônimo")
+        if not text_body:
+            return
+        now = datetime.now()
+        payload = {
+            "type":   "message",
+            "sender": sender,
+            "text":   text_body,
+            "time":   now.strftime("%H:%M"),
+        }
+        if not IS_REPLICA:
+            try:
+                persist_message(sender, text_body)
+            except Exception as e:
+                log.error("Erro ao persistir: %s", e)
+            forward_to_replica(payload)
+        broadcast(payload, exclude=sid)
 
-# ---------------------------------------------------------------------------
-# Eventos SocketIO
-# ---------------------------------------------------------------------------
+# ── Thread por cliente ────────────────────────────────────────────────────────
 
-@socketio.on("connect")
-def on_connect(auth=None) -> None:
+def handle_client(ws, sid: str):
     """
-    Novo cliente conectou.
-
-    Instancia uma Thread dedicada para carregar e enviar o histórico,
-    mantendo o loop de eventos livre para outros clientes.
+    Thread dedicada a uma conexão WebSocket.
+    Envia o histórico imediatamente e entra no loop de recepção.
     """
-    sid = request.sid
-    log.info("Nova conexão: sid '%s'. Iniciando thread de setup.", sid[:8])
+    with clients_lock:
+        clients[sid] = ws
 
-    t = threading.Thread(
-        target=client_setup_thread,
-        args=(sid,),
-        daemon=True,
-        name=f"setup-{sid[:8]}",
-    )
+    log.info("Conectado: %s %s", sid, ws.remote_address)
+
+    # Envia histórico
+    try:
+        _send(ws, {"type": "history_load", "data": load_history()})
+    except Exception as e:
+        log.error("Erro ao enviar histórico para %s: %s", sid, e)
+
+    # Loop de recepção (esta thread fica bloqueada aqui)
+    try:
+        for raw in ws:
+            try:
+                process_frame(json.loads(raw), sid)
+            except json.JSONDecodeError:
+                continue
+    except Exception as e:
+        log.debug("Conexão encerrada (%s): %s", sid, e)
+    finally:
+        _remove_client(sid)
+        log.info("Desconectado: %s", sid)
+
+# ── Handler do servidor WebSocket ────────────────────────────────────────────
+
+def ws_handler(ws):
+    """
+    Ponto de entrada do websockets.sync.server para cada nova conexão.
+    Detecta se é o primário se registrando (na réplica) ou um cliente comum.
+    """
+    global client_counter, replica_ws
+
+    # Lê o primeiro frame para identificar o tipo de conexão
+    try:
+        first_raw = ws.recv(timeout=3)
+        first = json.loads(first_raw)
+    except Exception:
+        first = {}
+
+    # Primário registrando-se na réplica
+    if first.get("type") == "__primary__":
+        if IS_REPLICA:
+            log.info("Primário conectado — iniciando monitor")
+            primary_monitor(ws)   # bloqueia até o primário cair
+        return
+
+    # Cliente comum
+    with counter_lock:
+        client_counter += 1
+        sid = f"client-{client_counter}"
+
+    # Cria thread dedicada e aguarda o primeiro frame
+    def _run():
+        with clients_lock:
+            clients[sid] = ws
+
+        log.info("Conectado: %s %s", sid, ws.remote_address)
+
+        # Envia histórico
+        try:
+            _send(ws, {"type": "history_load", "data": load_history()})
+        except Exception as e:
+            log.error("Erro ao enviar histórico para %s: %s", sid, e)
+
+        # Processa o primeiro frame
+        if first:
+            try:
+                process_frame(first, sid)
+            except Exception:
+                pass
+
+        # Loop de recepção
+        try:
+            for raw in ws:
+                try:
+                    process_frame(json.loads(raw), sid)
+                except json.JSONDecodeError:
+                    continue
+        except Exception as e:
+            log.debug("Conexão encerrada (%s): %s", sid, e)
+        finally:
+            _remove_client(sid)
+            log.info("Desconectado: %s", sid)
+
+    t = threading.Thread(target=_run, name=f"Client-{sid}", daemon=True)
     t.start()
+    t.join()   # ws_handler deve bloquear enquanto o cliente está conectado
 
+# ── Thread de replicação (primário) ──────────────────────────────────────────
 
-@socketio.on("message")
-def on_message(data: dict) -> None:
-    """
-    Recebe uma mensagem do cliente e despacha para thread dedicada.
-    """
-    t = threading.Thread(
-        target=handle_message_thread,
-        args=(data,),
-        daemon=True,
-        name=f"msg-{data.get('sender', '?')[:8]}",
+def replication_connector():
+    """Primário: mantém conexão WebSocket com a réplica e envia heartbeats."""
+    global replica_ws
+    url = f"ws://{REPLICA_WS_HOST}:{REPLICA_WS_PORT}"
+    while True:
+        try:
+            log.info("Conectando à réplica: %s…", url)
+            with ws_client_sync.connect(url) as rws:
+                rws.send(json.dumps({"type": "__primary__"}))
+                with replica_lock:
+                    replica_ws = rws
+                log.info("✓ Réplica conectada")
+                while True:
+                    time.sleep(5)
+                    try:
+                        rws.send(json.dumps({"type": "__heartbeat__"}))
+                    except Exception:
+                        break
+        except Exception as e:
+            log.warning("Réplica indisponível: %s — tentando em 5 s…", e)
+        with replica_lock:
+            replica_ws = None
+        time.sleep(5)
+
+# ── Monitor do primário (réplica) ─────────────────────────────────────────────
+
+def primary_monitor(primary_ws):
+    """Réplica: lê frames do primário e distribui para clientes locais."""
+    log.info("Monitorando primário…")
+    try:
+        for raw in primary_ws:
+            try:
+                frame = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if frame.get("type") == "__heartbeat__":
+                continue
+            if frame.get("__replica__"):
+                inner = {k: v for k, v in frame.items() if k != "__replica__"}
+                broadcast(inner)
+    except Exception as e:
+        log.debug("Monitor encerrado: %s", e)
+
+    log.warning(
+        "⚠ Primário caiu! Réplica %s:%s agora é o nó ativo.",
+        WS_HOST, WS_PORT,
     )
-    t.start()
 
+# ── Entry point ───────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Ponto de entrada
-# ---------------------------------------------------------------------------
+def run_http():
+    log.info("HTTP Flask ouvindo na porta %s", HTTP_PORT)
+    flask_app.run(host="0.0.0.0", port=HTTP_PORT, use_reloader=False)
+
+def run_ws():
+    role = "réplica" if IS_REPLICA else "primário"
+    log.info("WebSocket (%s) ouvindo em %s:%s", role, WS_HOST, WS_PORT)
+    with ws_sync.serve(ws_handler, WS_HOST, WS_PORT) as server:
+        server.serve_forever()
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    log.info("Servidor iniciado na porta %s.", port)
-    socketio.run(app, host="0.0.0.0", port=port, allow_unsafe_werkzeug=True)
+    threading.Thread(target=run_http, name="HTTP", daemon=True).start()
+
+    if not IS_REPLICA:
+        threading.Thread(
+            target=replication_connector, name="ReplicaConn", daemon=True
+        ).start()
+
+    try:
+        run_ws()
+    except KeyboardInterrupt:
+        log.info("Servidor encerrado.")

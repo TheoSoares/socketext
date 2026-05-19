@@ -1,60 +1,74 @@
 # ★ SockeText
 
-Chat em tempo real com suporte a múltiplos usuários, histórico persistente e failover automático entre servidores.
+Chat em tempo real com suporte a múltiplos servidores WebSocket, histórico persistente, indicador de digitação e tolerância a falhas por replicação.
+
+Construído com **WebSockets puros + threading** no backend, **Flask** no frontend e **PostgreSQL** como banco de dados. **Sem Flask-SocketIO.**
+
+---
 
 ## Arquitetura
 
 ```
-[Browser]
-    │  WebSocket (Socket.IO)
-    ▼
-[Frontend — Flask + SocketIO]        porta 8000
-    │  TCP socket (cliente manual)
-    │  Thread de recepção dedicada   ← requisito
-    │  tryConnect: fallback automático entre servidores
-    ▼
-[Backend A — TCP Server]   [Backend B — TCP Server]
-    porta 5000                   porta 5000
-    host-1                       host-2
-         │                            │
-         └──────────┬─────────────────┘
-                    ▼
-              PostgreSQL
-          (histórico de mensagens)
+frontend/               → Cliente Flask (porta definida por PORT)
+│  client.py            → Rotas HTTP (login, chat)
+│  requirements.txt
+│  templates/           → HTML (login.html, chat.html)
+│  static/
+│     script.js         → Web Worker para recepção + fila de envio
+│     style.css
+│
+backend/                → Servidor WebSocket (porta definida por WS_PORT)
+│  server.py            → Threads: HTTP, WS-Acceptor, por-cliente, replicação
+│  requirements.txt
 ```
 
-### Por que essa arquitetura atende os requisitos
+### Modelo de threads
 
-| Requisito | Implementação |
+| Thread | Responsável |
 |---|---|
-| Thread por conexão no servidor | `backend/server.py` — `threading.Thread` instanciada em `accept_loop()` para cada frontend conectado |
-| Thread de recepção no cliente | `frontend/client.py` — `BackendConnection._receive_loop()` roda em thread dedicada bloqueada em `recv()` |
-| Tolerância a falhas | `frontend/client.py` — `tryConnect` tenta cada servidor da lista em ordem; se todos falharem, aguarda 2s e reinicia |
-| Interface web | Flask serve HTML/CSS/JS; browser usa Socket.IO |
+| `HTTP` | Flask serve `/history` e `/health` |
+| `WS-Server` | `websockets.sync.server` — aceita conexões |
+| `Client-N` | Uma thread por cliente — loop de recepção e envio |
+| `ReplicaConn` | Primário mantém conexão com a réplica e envia heartbeats |
+| `PrimaryMonitor` | Réplica detecta queda do primário e distribui mensagens replicadas |
+| `RecvWorker` (browser) | Web Worker dedicado à recepção de mensagens no cliente |
+
+### Protocolo
+
+Conexão WebSocket nativa (não Socket.IO). Cada mensagem é um JSON.
+
+Tipos de frame:
+
+| `type` | Direção | Descrição |
+|---|---|---|
+| `join` | cliente → servidor | identificação ao conectar |
+| `history_load` | servidor → cliente | histórico completo |
+| `message` | bidirecional | mensagem de chat |
+| `typing` / `stop_typing` | cliente → servidor → outros | indicador de digitação |
+| `__primary__` | primário → réplica | registro da conexão de replicação |
+| `__heartbeat__` | primário → réplica | keep-alive a cada 5 s |
+| `__replica__` | primário → réplica | envelope de mensagem replicada |
 
 ---
 
-## Estrutura de arquivos
+## Funcionalidades
 
-```
-socketext/
-├── backend/
-│   ├── server.py          # Servidor TCP: aceita conexões, threads por cliente, broadcast, PostgreSQL
-│   ├── requirements.txt
-│   └── .env.example
-├── frontend/
-│   ├── client.py          # Flask HTTP + cliente TCP com thread de recepção e tryConnect
-│   ├── requirements.txt
-│   ├── .env.example
-│   ├── templates/
-│   │   ├── login.html
-│   │   └── chat.html
-│   └── static/
-│       ├── script.js      # Socket.IO client: envio, recepção, indicador de digitação
-│       └── style.css
-├── schema.sql             # DDL do banco de dados
-└── README.md
-```
+- Mensagens em tempo real via WebSocket puro
+- Uma **thread dedicada por conexão** no servidor
+- **Web Worker** dedicado à recepção no navegador
+- Histórico de mensagens persistido em PostgreSQL
+- Indicador de "digitando…" para outros participantes
+- Fila de envio com reordenamento pós-reconexão
+- **Replicação automática**: primário replica mensagens para o secundário
+- **Fallback automático**: frontend tenta servidores em sequência
+- Interface responsiva em português
+
+---
+
+## Requisitos
+
+- Python 3.10+
+- PostgreSQL
 
 ---
 
@@ -67,140 +81,137 @@ git clone https://github.com/seu-usuario/socketext.git
 cd socketext
 ```
 
-### 2. Crie a tabela no banco de dados
+### 2. Instale as dependências
 
 ```bash
-psql -U usuario -d socketext -f schema.sql
+cd backend  && pip install -r requirements.txt
+cd ../frontend && pip install -r requirements.txt
 ```
 
-### 3. Configure os arquivos `.env`
+### 3. Crie a tabela no banco de dados
 
-**Backend:**
+```sql
+CREATE TABLE messages (
+    id        SERIAL PRIMARY KEY,
+    username  TEXT NOT NULL,
+    message   TEXT NOT NULL,
+    sent_at   TIMESTAMP NOT NULL DEFAULT NOW()
+);
+```
+
+### 4. Configure os `.env`
+
+**`backend/.env` (primário):**
+```env
+INTERNAL_DATABASE_URL=postgresql://user:senha@host/banco
+EXTERNAL_DATABASE_URL=postgresql://user:senha@host-externo/banco
+DEBUG=false
+SECRET_KEY=chave-longa-e-aleatoria
+WS_PORT=9000
+HTTP_PORT=5000
+IS_REPLICA=false
+REPLICA_WS_HOST=127.0.0.1
+REPLICA_WS_PORT=9001
+```
+
+**`backend/.env.replica` (réplica — copie e ajuste):**
+```env
+INTERNAL_DATABASE_URL=postgresql://user:senha@host/banco
+SECRET_KEY=mesma-chave
+WS_PORT=9001
+HTTP_PORT=5001
+IS_REPLICA=true
+```
+
+**`frontend/.env`:**
+```env
+SECRET_KEY=mesma-chave
+# formato: host:wsPort:httpPort
+SOCKET_SERVERS=127.0.0.1:9000:5000,127.0.0.1:9001:5001
+PORT=8000
+```
+
+### 5. Inicie os servidores
+
+**Primário:**
 ```bash
 cd backend
-cp .env.example .env
-# Edite .env com suas credenciais
+python server.py
+```
+
+**Réplica (em outro terminal ou máquina):**
+```bash
+cd backend
+WS_PORT=9001 HTTP_PORT=5001 IS_REPLICA=true python server.py
 ```
 
 **Frontend:**
 ```bash
 cd frontend
-cp .env.example .env
-# Edite .env com suas credenciais
-```
-
-### 4. Instale as dependências
-
-```bash
-cd backend && pip install -r requirements.txt
-cd ../frontend && pip install -r requirements.txt
-```
-
----
-
-## Executando
-
-### Servidor A (host-1)
-
-```bash
-cd backend
-PORT=5000 python server.py
-```
-
-### Servidor B (host-2)
-
-```bash
-cd backend
-PORT=5000 python server.py
-```
-
-> Ambos os servidores são idênticos e independentes — não há primário nem réplica.  
-> Cada um persiste mensagens no mesmo banco PostgreSQL compartilhado.
-
-### Frontend
-
-```bash
-cd frontend
 python client.py
 ```
 
-Acesse **http://localhost:8000**, digite seu nome e comece a conversar.
+Acesse **http://localhost:8000**.
 
 ---
 
-## Como funciona o failover
+## Como funciona a replicação
 
-O frontend mantém uma lista ordenada de servidores backend em `BACKEND_SERVERS`.  
-Ao conectar (ou reconectar após queda), o `tryConnect` percorre a lista em ordem:
+```
+Cliente A ──────────► Primário (9000) ──────────► Réplica (9001)
+                           │                           │
+                     persiste no BD             distribui para
+                     (INSERT)                   clientes locais
+```
 
-1. Tenta o primeiro servidor com timeout de 3s.
-2. Se conectar, envia o handshake e inicia a thread de recepção.
-3. Se a conexão cair, tenta o próximo servidor da lista.
-4. Se esgotar a lista sem sucesso, aguarda 2s e reinicia do início.
-
-O browser recebe uma notificação via Socket.IO em cada mudança de estado, e o histórico é recarregado automaticamente ao reconectar.
+1. O primário tenta se conectar à réplica em loop ao iniciar.
+2. Ao conectar, envia `{"type":"__primary__"}` para identificar-se.
+3. Cada mensagem de chat é persistida **somente pelo primário** e depois encaminhada para a réplica com o envelope `{"__replica__":true, ...}`.
+4. A réplica distribui o frame recebido para seus clientes locais.
+5. Se o primário cair, a réplica loga o evento. O frontend detecta a queda e conecta no próximo servidor da lista (`SOCKET_SERVERS`).
 
 ---
 
-## Variáveis de ambiente
+## Deploy no Render
 
-### `backend/.env`
+### Backend (primário)
 
-| Variável | Descrição | Padrão |
-|---|---|---|
-| `PORT` | Porta TCP do servidor | `5000` |
-| `INTERNAL_DATABASE_URL` | PostgreSQL em produção | — |
-| `EXTERNAL_DATABASE_URL` | PostgreSQL em debug local | — |
-| `DEBUG` | `true` usa a URL externa | `false` |
-| `HISTORY_LIMIT` | Número de mensagens no histórico inicial | `50` |
-| `SECRET_KEY` | Chave secreta (usada pelo Flask no frontend) | — |
+1. **New → Web Service**, Root Directory: `backend`
+2. Build: `pip install -r requirements.txt`
+3. Start: `python server.py`
+4. Variáveis de ambiente: todas do `backend/.env`
 
-### `frontend/.env`
+### Backend (réplica)
 
-| Variável | Descrição | Padrão |
-|---|---|---|
-| `SECRET_KEY` | Chave secreta Flask | — |
-| `BACKEND_SERVERS` | Endereços TCP separados por vírgula | `localhost:5000` |
-| `PORT` | Porta HTTP do frontend | `8000` |
+1. Mesmo repositório, Root Directory: `backend`
+2. Start: `python server.py`
+3. Variáveis: mesmas, mas com `IS_REPLICA=true`, `WS_PORT` diferente, e `REPLICA_WS_HOST`/`REPLICA_WS_PORT` apontando para o primário
 
-**Exemplo com dois servidores:**
-```env
-BACKEND_SERVERS=host-1.exemplo.com:5000,host-2.exemplo.com:5000
-```
+### Frontend
+
+1. Root Directory: `frontend`
+2. Start: `python client.py`
+3. `SOCKET_SERVERS`: URLs públicas do Render para cada backend, formato `host:wsPort:httpPort`
 
 ---
 
-## Protocolo TCP (backend ↔ frontend)
+## Estrutura de pastas
 
-Todas as mensagens são JSON delimitadas por `\n`.
-
-### Handshake (frontend → backend)
-```json
-{"type": "join", "username": "Alice"}
 ```
-
-### Histórico (backend → frontend, logo após handshake)
-```json
-{
-  "type": "history",
-  "messages": [
-    {"sender": "Alice", "text": "Olá!", "time": "14:32"}
-  ]
-}
-```
-
-### Mensagem (bidirecional)
-```json
-{"type": "message", "sender": "Alice", "text": "Olá!"}
-```
-
-### Digitando (frontend → backend → outros frontends)
-```json
-{"type": "typing"}
-{"type": "stop_typing"}
-```
-
-### Sistema (backend → frontend)
-```json
-{"type": "system", "text": "Alice entrou no chat."}
+socketext/
+├── backend/
+│   ├── server.py
+│   ├── requirements.txt
+│   └── .env
+├── frontend/
+│   ├── client.py
+│   ├── requirements.txt
+│   ├── .env
+│   ├── templates/
+│   │   ├── login.html
+│   │   └── chat.html
+│   └── static/
+│       ├── script.js
+│       └── style.css
+└── README.md
 ```
