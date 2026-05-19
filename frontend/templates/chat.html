@@ -8,10 +8,14 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script>
+    const SERVERS = {{ servers | tojson }};
+    const NAME    = {{ name | tojson }};
+  </script>
 </head>
 <body class="chat-page">
 
-  <!-- Container central com largura máxima -->
   <div class="chat-wrap">
 
     <header class="chat-header">
@@ -20,9 +24,13 @@
         <span class="chat-header__name">SockeText</span>
       </div>
       <div class="chat-header__right">
+        <span class="chat-header__status">
+          <span class="status-dot" id="statusDot"></span>
+          <span id="statusLabel">conectando...</span>
+        </span>
         <span class="chat-header__user">
-          <span class="chat-header__avatar">{{ username[0]|upper }}</span>
-          {{ username }}
+          <span class="chat-header__avatar">{{ name[0]|upper }}</span>
+          {{ name }}
         </span>
         <a href="/logout" class="chat-header__logout">Sair</a>
       </div>
@@ -52,10 +60,8 @@
       </div>
     </footer>
 
-  </div><!-- /chat-wrap -->
+  </div>
 
-  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-  <script>window.CURRENT_USER = "{{ username }}";</script>
   <script src="{{ url_for('static', filename='script.js') }}"></script>
 
 </body>

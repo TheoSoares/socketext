@@ -1,21 +1,24 @@
 """
-server.py — Servidor TCP principal do SockeText.
+server.py — Servidor principal do SockeText.
 
 Responsabilidades:
-  - Aceitar conexões TCP de clientes (frontends Flask)
-  - Instanciar uma Thread dedicada para cada conexão
-  - Fazer broadcast de mensagens para todos os clientes conectados
-  - Persistir e carregar histórico diretamente no PostgreSQL
+  - Aceitar conexões WebSocket de browsers via Flask-SocketIO.
+  - Usar Redis como message_queue para sincronizar múltiplas instâncias:
+    mensagens emitidas em um servidor chegam a clientes conectados nos demais.
+  - Gerenciar threads manualmente: uma Thread dedicada por cliente conectado,
+    responsável por carregar histórico e processar mensagens sem bloquear
+    o loop principal do SocketIO.
+  - Persistir e carregar histórico via PostgreSQL.
 """
 
-import socket
-import threading
-import json
 import os
+import threading
 import logging
 
-import psycopg2
-import psycopg2.extras
+from flask import Flask, request
+from flask_socketio import SocketIO, emit
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -24,242 +27,154 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-HOST = "0.0.0.0"
-PORT = int(os.getenv("PORT", 5000))
-
-_DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-_DATABASE_URL = os.getenv("EXTERNAL_DATABASE_URL" if _DEBUG else "INTERNAL_DATABASE_URL")
-
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", 50))
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Estado compartilhado entre threads
-# ---------------------------------------------------------------------------
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY")
 
-# Dicionário {socket: username} de clientes conectados
-clients: dict[socket.socket, str] = {}
+# Redis como message_queue: garante que mensagens emitidas em uma instância
+# sejam entregues a clientes conectados em outras instâncias do servidor.
+# async_mode="threading" substitui gevent — threads gerenciadas manualmente.
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    message_queue=os.environ.get("REDIS_URL"),
+    async_mode="threading",
+)
 
-# Lock para acesso seguro ao dicionário de clientes
-clients_lock = threading.Lock()
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+app.config["SQLALCHEMY_DATABASE_URI"] = (
+    os.environ.get("EXTERNAL_DATABASE_URL")
+    if DEBUG
+    else os.environ.get("INTERNAL_DATABASE_URL")
+)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
+db = SQLAlchemy(app)
 
 # ---------------------------------------------------------------------------
 # Banco de dados
 # ---------------------------------------------------------------------------
 
-def _db_connect() -> psycopg2.extensions.connection:
-    """Abre e retorna uma nova conexão com o banco de dados."""
-    return psycopg2.connect(_DATABASE_URL)
+def load_history() -> list[dict]:
+    """Retorna todas as mensagens do banco em ordem cronológica."""
+    sql = text("SELECT username, sent_at, message FROM messages ORDER BY sent_at")
+    with app.app_context():
+        result = db.session.execute(sql)
+        return [
+            {
+                "sender": row[0],
+                "time":   row[1].strftime("%H:%M"),
+                "text":   row[2],
+            }
+            for row in result
+        ]
 
 
-def save_message(username: str, text: str) -> None:
+def save_message(username: str, message: str) -> None:
     """Persiste uma mensagem no banco de dados."""
-    sql = "INSERT INTO messages (username, message) VALUES (%s, %s)"
+    sql = text("INSERT INTO messages (username, message) VALUES (:username, :message)")
     try:
-        with _db_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, (username, text))
-    except psycopg2.Error as e:
+        with app.app_context():
+            db.session.execute(sql, {"username": username, "message": message})
+            db.session.commit()
+    except Exception as e:
         log.error("Erro ao salvar mensagem: %s", e)
 
 
-def load_history() -> list[dict]:
-    """Retorna as últimas HISTORY_LIMIT mensagens em ordem cronológica."""
-    sql = """
-        SELECT username, message, sent_at
-        FROM messages
-        ORDER BY sent_at DESC
-        LIMIT %s
-    """
-    try:
-        with _db_connect() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql, (HISTORY_LIMIT,))
-                rows = cur.fetchall()
-
-        return [
-            {
-                "sender": row["username"],
-                "text": row["message"],
-                "time": row["sent_at"].strftime("%H:%M"),
-            }
-            for row in reversed(rows)
-        ]
-    except psycopg2.Error as e:
-        log.error("Erro ao carregar histórico: %s", e)
-        return []
-
-
 # ---------------------------------------------------------------------------
-# Broadcast
+# Threads dedicadas
 # ---------------------------------------------------------------------------
 
-def broadcast(payload: dict, exclude: socket.socket | None = None) -> None:
+def client_setup_thread(sid: str) -> None:
     """
-    Envia um payload JSON para todos os clientes conectados.
+    Thread dedicada ao setup de um novo cliente.
+
+    Carrega o histórico do banco (I/O potencialmente lento) e o envia
+    apenas para o cliente recém-conectado, sem bloquear o loop principal.
 
     Args:
-        payload:  Dicionário a enviar (serializado para JSON).
-        exclude:  Socket que NÃO deve receber (geralmente o remetente).
+        sid: ID da sessão SocketIO do cliente.
     """
-    message = (json.dumps(payload) + "\n").encode("utf-8")
-
-    with clients_lock:
-        for conn in list(clients):
-            if conn is exclude:
-                continue
-            try:
-                conn.sendall(message)
-            except OSError:
-                log.warning("Falha ao enviar para %s.", clients.get(conn, "?"))
+    log.info("Thread de setup iniciada para sid '%s'.", sid[:8])
+    history = load_history()
+    socketio.emit("history_load", history, to=sid)
+    log.info("Histórico enviado para sid '%s' (%d msgs).", sid[:8], len(history))
 
 
-# ---------------------------------------------------------------------------
-# Handler de cliente (executa em thread dedicada)
-# ---------------------------------------------------------------------------
-
-def handle_client(conn: socket.socket, addr: tuple) -> None:
+def handle_message_thread(data: dict) -> None:
     """
-    Função executada em uma Thread dedicada para cada cliente conectado.
+    Thread dedicada ao processamento de uma mensagem recebida.
 
-    Protocolo:
-      1. Cliente envia JSON: {"type": "join", "username": "<nome>"}
-      2. Servidor responde com histórico e notifica demais usuários.
-      3. Loop de recepção de mensagens até desconexão.
+    Separa persistência e broadcast do loop de eventos, evitando que
+    operações de I/O (banco) bloqueiem outros clientes.
+
+    Args:
+        data: Dicionário com os dados da mensagem recebida.
     """
-    username = None
-    buffer = ""
+    msg_type = data.get("type")
 
-    try:
-        # --- Handshake ---
-        raw = conn.recv(1024).decode("utf-8")
-        data = json.loads(raw.strip())
+    if msg_type in ("typing", "stop_typing"):
+        # Repassa indicador de digitação sem persistir
+        socketio.emit("message", data, include_self=False)
+        return
 
-        if data.get("type") != "join":
-            log.warning("Handshake inválido de %s.", addr)
-            conn.close()
-            return
-
-        username = data["username"]
-        log.info("'%s' conectou (%s:%s).", username, *addr)
-
-        with clients_lock:
-            clients[conn] = username
-
-        # Envia histórico apenas para o novo cliente
-        history = load_history()
-        conn.sendall(
-            (json.dumps({"type": "history", "messages": history}) + "\n").encode("utf-8")
-        )
-
-        # Notifica os outros sobre a entrada
-        broadcast(
-            {"type": "system", "text": f"{username} entrou no chat."},
-            exclude=conn,
-        )
-
-        # --- Loop principal ---
-        while True:
-            chunk = conn.recv(4096).decode("utf-8")
-            if not chunk:
-                break
-
-            buffer += chunk
-
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-
-                msg_data = json.loads(line)
-                msg_type = msg_data.get("type")
-
-                if msg_type == "message":
-                    text = msg_data.get("text", "")
-                    log.info("[%s] %s", username, text)
-                    save_message(username, text)
-                    broadcast({
-                        "type": "message",
-                        "sender": username,
-                        "text": text,
-                    })
-
-                elif msg_type in ("typing", "stop_typing"):
-                    broadcast({
-                        "type": msg_type,
-                        "sender": username,
-                    }, exclude=conn)
-
-    except (json.JSONDecodeError, KeyError) as e:
-        log.error("Erro de protocolo de '%s': %s", username or addr, e)
-
-    except ConnectionResetError:
-        log.info("'%s' desconectou abruptamente.", username or addr)
-
-    finally:
-        with clients_lock:
-            clients.pop(conn, None)
-        conn.close()
-
-        if username:
-            log.info("'%s' desconectou.", username)
-            broadcast({"type": "system", "text": f"{username} saiu do chat."})
+    if msg_type == "message":
+        username = data.get("sender", "")
+        message  = data.get("text", "")
+        log.info("[%s] %s", username, message)
+        save_message(username, message)
+        # O Redis message_queue garante entrega às demais instâncias.
+        socketio.emit("message", data, include_self=False, broadcast=True)
 
 
 # ---------------------------------------------------------------------------
-# Loop de aceitação de conexões
+# Eventos SocketIO
 # ---------------------------------------------------------------------------
 
-def accept_loop(server_socket: socket.socket) -> None:
-    """Aguarda novas conexões TCP e cria uma Thread para cada uma."""
-    log.info("Aguardando conexões na porta %s...", PORT)
+@socketio.on("connect")
+def on_connect(auth=None) -> None:
+    """
+    Novo cliente conectou.
 
-    while True:
-        try:
-            conn, addr = server_socket.accept()
-        except OSError:
-            break
+    Instancia uma Thread dedicada para carregar e enviar o histórico,
+    mantendo o loop de eventos livre para outros clientes.
+    """
+    sid = request.sid
+    log.info("Nova conexão: sid '%s'. Iniciando thread de setup.", sid[:8])
 
-        thread = threading.Thread(
-            target=handle_client,
-            args=(conn, addr),
-            daemon=True,
-            name=f"client-{addr[0]}:{addr[1]}",
-        )
-        thread.start()
-        log.info(
-            "Thread '%s' iniciada. Clientes ativos: %d",
-            thread.name,
-            threading.active_count() - 1,
-        )
+    t = threading.Thread(
+        target=client_setup_thread,
+        args=(sid,),
+        daemon=True,
+        name=f"setup-{sid[:8]}",
+    )
+    t.start()
+
+
+@socketio.on("message")
+def on_message(data: dict) -> None:
+    """
+    Recebe uma mensagem do cliente e despacha para thread dedicada.
+    """
+    t = threading.Thread(
+        target=handle_message_thread,
+        args=(data,),
+        daemon=True,
+        name=f"msg-{data.get('sender', '?')[:8]}",
+    )
+    t.start()
 
 
 # ---------------------------------------------------------------------------
 # Ponto de entrada
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((HOST, PORT))
-    server_socket.listen(10)
-
-    log.info("Servidor iniciado na porta %s.", PORT)
-
-    try:
-        accept_loop(server_socket)
-    except KeyboardInterrupt:
-        log.info("Encerrando servidor.")
-    finally:
-        server_socket.close()
-
-
 if __name__ == "__main__":
-    main()
+    port = int(os.getenv("PORT", 5000))
+    log.info("Servidor iniciado na porta %s.", port)
+    socketio.run(app, host="0.0.0.0", port=port, allow_unsafe_werkzeug=True)
