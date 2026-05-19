@@ -39,6 +39,7 @@
       overflow: hidden;
     }
 
+    /* ── Background grid ── */
     body::before {
       content: '';
       position: fixed;
@@ -50,17 +51,20 @@
       pointer-events: none;
     }
 
+    /* ── Glow orb ── */
     body::after {
       content: '';
       position: fixed;
       width: 500px;
       height: 500px;
       background: radial-gradient(circle, rgba(124,106,247,0.08) 0%, transparent 70%);
-      top: 50%; left: 50%;
+      top: 50%;
+      left: 50%;
       transform: translate(-50%, -50%);
       pointer-events: none;
     }
 
+    /* ── Card ── */
     .card {
       position: relative;
       z-index: 1;
@@ -81,60 +85,120 @@
       to   { opacity: 1; transform: translateY(0); }
     }
 
-    .logo { display: flex; align-items: center; gap: 10px; }
+    /* ── Logo ── */
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
     .logo-icon {
-      width: 36px; height: 36px;
+      width: 36px;
+      height: 36px;
       background: var(--accent);
       border-radius: var(--radius-sm);
-      display: flex; align-items: center; justify-content: center;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       flex-shrink: 0;
     }
+
+    .logo-icon svg { display: block; }
+
     .logo-name {
       font-family: var(--font-mono);
-      font-size: 17px; font-weight: 500;
-      color: var(--text); letter-spacing: 0.01em;
+      font-size: 17px;
+      font-weight: 500;
+      color: var(--text);
+      letter-spacing: 0.01em;
     }
 
+    /* ── Heading ── */
     .heading { display: flex; flex-direction: column; gap: 6px; }
-    .heading h1 { font-size: 20px; font-weight: 500; color: var(--text); letter-spacing: -0.01em; }
-    .heading p  { font-size: 13px; color: var(--text-2); line-height: 1.5; }
 
-    .form  { display: flex; flex-direction: column; gap: 12px; }
+    .heading h1 {
+      font-size: 20px;
+      font-weight: 500;
+      color: var(--text);
+      letter-spacing: -0.01em;
+    }
+
+    .heading p {
+      font-size: 13px;
+      color: var(--text-2);
+      line-height: 1.5;
+    }
+
+    /* ── Form ── */
+    .form { display: flex; flex-direction: column; gap: 12px; }
+
     .field { display: flex; flex-direction: column; gap: 6px; }
+
     .field label {
-      font-size: 12px; font-weight: 500;
-      color: var(--text-2); letter-spacing: 0.04em; text-transform: uppercase;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-2);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
     }
+
     .field input {
-      background: var(--surface2); border: 1px solid var(--border);
-      border-radius: var(--radius-sm); padding: 10px 14px;
-      font-family: var(--font); font-size: 14px; color: var(--text);
-      outline: none; transition: border-color 0.15s; width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 10px 14px;
+      font-family: var(--font);
+      font-size: 14px;
+      color: var(--text);
+      outline: none;
+      transition: border-color 0.15s;
+      width: 100%;
     }
+
     .field input::placeholder { color: var(--text-3); }
+
     .field input:focus { border-color: var(--accent-dim); }
 
+/* ── Button ── */
     .btn-enter {
-      margin-top: 4px; width: 100%; padding: 11px;
-      border: none; border-radius: var(--radius-sm);
-      background: var(--accent); color: #fff;
-      font-family: var(--font); font-size: 14px; font-weight: 500;
-      cursor: pointer; transition: background 0.15s, transform 0.1s;
-      display: flex; align-items: center; justify-content: center; gap: 8px;
+      margin-top: 4px;
+      width: 100%;
+      padding: 11px;
+      border: none;
+      border-radius: var(--radius-sm);
+      background: var(--accent);
+      color: #fff;
+      font-family: var(--font);
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.1s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
     }
+
     .btn-enter:hover  { background: #6a58e0; }
     .btn-enter:active { transform: scale(0.98); }
+
     .btn-enter svg { transition: transform 0.2s; }
     .btn-enter:hover svg { transform: translateX(3px); }
 
+    /* ── Footer note ── */
     .card-footer {
-      font-family: var(--font-mono); font-size: 10px;
-      color: var(--text-3); text-align: center; letter-spacing: 0.04em;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-3);
+      text-align: center;
+      letter-spacing: 0.04em;
     }
   </style>
 </head>
 <body>
+
   <div class="card" role="main">
+
     <div class="logo">
       <div class="logo-icon">
         <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
@@ -151,14 +215,21 @@
 
     <form class="form" method="POST" action="/login">
       <div class="field">
-        <label for="name">Seu nome</label>
+        <label for="nameInput">Seu nome</label>
         <input
-          type="text" id="name" name="name"
+          type="text"
+          id="name"
+          name="name"
           placeholder="ex: Maria Silva"
-          maxlength="32" autocomplete="off" autocorrect="off"
-          spellcheck="false" autofocus required
+          maxlength="32"
+          autocomplete="off"
+          autocorrect="off"
+          spellcheck="false"
+          autofocus
+          required
         />
       </div>
+
       <button class="btn-enter" type="submit">
         Entrar
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -168,6 +239,10 @@
     </form>
 
     <p class="card-footer">CHAT EM TEMPO REAL · AO VIVO</p>
+
   </div>
+
+
+
 </body>
 </html>

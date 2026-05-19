@@ -1,66 +1,36 @@
 # ★ SockeText
 
-Chat em tempo real com suporte a múltiplos servidores WebSocket, histórico persistente, indicador de digitação e tolerância a falhas por replicação.
+Chat em tempo real com suporte a múltiplos servidores WebSocket, histórico persistente e indicador de digitação.
 
-Construído com **WebSockets puros + threading** no backend, **Flask** no frontend e **PostgreSQL** como banco de dados. **Sem Flask-SocketIO.**
+Construído com **Flask + Flask-SocketIO** no backend, **Flask** no frontend e **PostgreSQL** como banco de dados. Utiliza **Redis** como message queue para sincronizar mensagens entre instâncias do servidor.
 
 ---
 
 ## Arquitetura
 
 ```
-frontend/               → Cliente Flask (porta definida por PORT)
-│  client.py            → Rotas HTTP (login, chat)
+frontend/          → Cliente Flask (porta definida por PORT)
+│  client.py       → Rotas HTTP (login, chat)
 │  requirements.txt
-│  templates/           → HTML (login.html, chat.html)
-│  static/
-│     script.js         → Web Worker para recepção + fila de envio
-│     style.css
+│  templates/      → HTML (login.html, chat.html)
+│  static/         → JS e CSS da interface
 │
-backend/                → Servidor WebSocket (porta definida por WS_PORT)
-│  server.py            → Threads: HTTP, WS-Acceptor, por-cliente, replicação
+backend/           → Servidor WebSocket (porta definida por PORT)
+│  server.py       → SocketIO: histórico, mensagens, typing
 │  requirements.txt
 ```
 
-### Modelo de threads
-
-| Thread | Responsável |
-|---|---|
-| `HTTP` | Flask serve `/history` e `/health` |
-| `WS-Server` | `websockets.sync.server` — aceita conexões |
-| `Client-N` | Uma thread por cliente — loop de recepção e envio |
-| `ReplicaConn` | Primário mantém conexão com a réplica e envia heartbeats |
-| `PrimaryMonitor` | Réplica detecta queda do primário e distribui mensagens replicadas |
-| `RecvWorker` (browser) | Web Worker dedicado à recepção de mensagens no cliente |
-
-### Protocolo
-
-Conexão WebSocket nativa (não Socket.IO). Cada mensagem é um JSON.
-
-Tipos de frame:
-
-| `type` | Direção | Descrição |
-|---|---|---|
-| `join` | cliente → servidor | identificação ao conectar |
-| `history_load` | servidor → cliente | histórico completo |
-| `message` | bidirecional | mensagem de chat |
-| `typing` / `stop_typing` | cliente → servidor → outros | indicador de digitação |
-| `__primary__` | primário → réplica | registro da conexão de replicação |
-| `__heartbeat__` | primário → réplica | keep-alive a cada 5 s |
-| `__replica__` | primário → réplica | envelope de mensagem replicada |
+A comunicação entre frontend e backend acontece via **WebSocket (Socket.IO)**. O frontend tenta se conectar a cada servidor listado em `SOCKET_SERVERS` em sequência, reconectando automaticamente em caso de queda.
 
 ---
 
 ## Funcionalidades
 
-- Mensagens em tempo real via WebSocket puro
-- Uma **thread dedicada por conexão** no servidor
-- **Web Worker** dedicado à recepção no navegador
-- Histórico de mensagens persistido em PostgreSQL
-- Indicador de "digitando…" para outros participantes
-- Fila de envio com reordenamento pós-reconexão
-- **Replicação automática**: primário replica mensagens para o secundário
-- **Fallback automático**: frontend tenta servidores em sequência
+- Mensagens em tempo real via WebSocket
+- Histórico de mensagens persistido em banco de dados (carregado ao conectar)
+- Indicador de "digitando..." para outros participantes
+- Fila de envio garantindo ordem das mensagens
+- Fallback automático entre múltiplos servidores WebSocket
 - Interface responsiva em português
 
 ---
@@ -69,6 +39,7 @@ Tipos de frame:
 
 - Python 3.10+
 - PostgreSQL
+- Redis
 
 ---
 
@@ -83,12 +54,23 @@ cd socketext
 
 ### 2. Instale as dependências
 
+**Backend:**
 ```bash
-cd backend  && pip install -r requirements.txt
-cd ../frontend && pip install -r requirements.txt
+cd backend
+pip install -r requirements.txt
 ```
 
-### 3. Crie a tabela no banco de dados
+**Frontend:**
+```bash
+cd frontend
+pip install -r requirements.txt
+```
+
+### 3. Configure os arquivos `.env`
+
+Crie um arquivo `.env` em cada pasta conforme as seções abaixo.
+
+### 4. Crie a tabela no banco de dados
 
 ```sql
 CREATE TABLE messages (
@@ -99,50 +81,18 @@ CREATE TABLE messages (
 );
 ```
 
-### 4. Configure os `.env`
-
-**`backend/.env` (primário):**
-```env
-INTERNAL_DATABASE_URL=postgresql://user:senha@host/banco
-EXTERNAL_DATABASE_URL=postgresql://user:senha@host-externo/banco
-DEBUG=false
-SECRET_KEY=chave-longa-e-aleatoria
-WS_PORT=9000
-HTTP_PORT=5000
-IS_REPLICA=false
-REPLICA_WS_HOST=127.0.0.1
-REPLICA_WS_PORT=9001
-```
-
-**`backend/.env.replica` (réplica — copie e ajuste):**
-```env
-INTERNAL_DATABASE_URL=postgresql://user:senha@host/banco
-SECRET_KEY=mesma-chave
-WS_PORT=9001
-HTTP_PORT=5001
-IS_REPLICA=true
-```
-
-**`frontend/.env`:**
-```env
-SECRET_KEY=mesma-chave
-# formato: host:wsPort:httpPort
-SOCKET_SERVERS=127.0.0.1:9000:5000,127.0.0.1:9001:5001
-PORT=8000
-```
-
 ### 5. Inicie os servidores
 
-**Primário:**
+**Backend** (produção com Gunicorn + gevent):
+```bash
+cd backend
+gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:$PORT server:app
+```
+
+**Backend** (desenvolvimento local):
 ```bash
 cd backend
 python server.py
-```
-
-**Réplica (em outro terminal ou máquina):**
-```bash
-cd backend
-WS_PORT=9001 HTTP_PORT=5001 IS_REPLICA=true python server.py
 ```
 
 **Frontend:**
@@ -151,47 +101,92 @@ cd frontend
 python client.py
 ```
 
-Acesse **http://localhost:8000**.
+Acesse **http://localhost:8000**, digite seu nome e comece a conversar.
 
 ---
 
-## Como funciona a replicação
+## Configuração do `.env`
 
-```
-Cliente A ──────────► Primário (9000) ──────────► Réplica (9001)
-                           │                           │
-                     persiste no BD             distribui para
-                     (INSERT)                   clientes locais
+### `backend/.env`
+
+| Variável | Descrição |
+|---|---|
+| `INTERNAL_DATABASE_URL` | URL de conexão PostgreSQL usada em produção (rede interna) |
+| `EXTERNAL_DATABASE_URL` | URL de conexão PostgreSQL usada em modo DEBUG (acesso externo) |
+| `DEBUG` | `true` usa `EXTERNAL_DATABASE_URL`; `false` usa a interna |
+| `SECRET_KEY` | Chave secreta do Flask — use uma string longa e aleatória |
+| `REDIS_URL` | URL de conexão Redis usada como message queue pelo SocketIO |
+| `PORT` | Porta em que o servidor WebSocket irá escutar (ex: `5000`) |
+
+**Exemplo:**
+```env
+INTERNAL_DATABASE_URL=postgresql://user:senha@host-interno/nome_do_banco
+EXTERNAL_DATABASE_URL=postgresql://user:senha@host-externo/nome_do_banco
+DEBUG=false
+SECRET_KEY=troque-por-uma-chave-segura-e-aleatoria
+REDIS_URL=redis://default:senha@host-redis:porta
+PORT=5000
 ```
 
-1. O primário tenta se conectar à réplica em loop ao iniciar.
-2. Ao conectar, envia `{"type":"__primary__"}` para identificar-se.
-3. Cada mensagem de chat é persistida **somente pelo primário** e depois encaminhada para a réplica com o envelope `{"__replica__":true, ...}`.
-4. A réplica distribui o frame recebido para seus clientes locais.
-5. Se o primário cair, a réplica loga o evento. O frontend detecta a queda e conecta no próximo servidor da lista (`SOCKET_SERVERS`).
+---
+
+### `frontend/.env`
+
+| Variável | Descrição |
+|---|---|
+| `SECRET_KEY` | Mesma chave usada no backend (para sessões Flask) |
+| `SOCKET_SERVERS` | Lista de URLs dos servidores WebSocket, separadas por vírgula |
+| `PORT` | Porta em que o frontend irá escutar (ex: `8000`) |
+
+**Exemplo:**
+```env
+SECRET_KEY=troque-por-uma-chave-segura-e-aleatoria
+SOCKET_SERVERS=http://192.168.1.10:5000,http://192.168.1.10:5001
+PORT=8000
+```
+
+O frontend tenta conectar aos servidores na ordem listada. Se o primeiro falhar, tenta o próximo automaticamente.
 
 ---
 
 ## Deploy no Render
 
-### Backend (primário)
+### Backend
 
-1. **New → Web Service**, Root Directory: `backend`
-2. Build: `pip install -r requirements.txt`
-3. Start: `python server.py`
-4. Variáveis de ambiente: todas do `backend/.env`
-
-### Backend (réplica)
-
-1. Mesmo repositório, Root Directory: `backend`
-2. Start: `python server.py`
-3. Variáveis: mesmas, mas com `IS_REPLICA=true`, `WS_PORT` diferente, e `REPLICA_WS_HOST`/`REPLICA_WS_PORT` apontando para o primário
+1. **New → Web Service**, conecte ao repositório
+2. **Root Directory:** `backend`
+3. **Build Command:** `pip install -r requirements.txt`
+4. **Start Command:**
+   ```bash
+   gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:$PORT server:app
+   ```
+5. Em **Environment Variables**, adicione as variáveis do `backend/.env`. O Render injeta `PORT` automaticamente — não é necessário definir manualmente.
 
 ### Frontend
 
-1. Root Directory: `frontend`
-2. Start: `python client.py`
-3. `SOCKET_SERVERS`: URLs públicas do Render para cada backend, formato `host:wsPort:httpPort`
+1. **New → Web Service**, conecte ao repositório
+2. **Root Directory:** `frontend`
+3. **Build Command:** `pip install -r requirements.txt`
+4. **Start Command:** `python client.py`
+5. Em **Environment Variables**, adicione as variáveis do `frontend/.env`. Em `SOCKET_SERVERS`, use a URL pública gerada pelo Render para cada instância do backend (ex: `https://socketext-backend.onrender.com`).
+
+> O `-w 1` no Gunicorn é obrigatório com WebSockets — múltiplos workers quebrariam as conexões persistentes. Para escalar, suba múltiplos serviços apontando para o mesmo Redis.
+
+---
+
+## Rodando múltiplas instâncias do backend
+
+Todas as instâncias devem apontar para o **mesmo Redis** — ele sincroniza as mensagens entre elas independentemente de qual instância o cliente estiver conectado.
+
+```bash
+# Instância 1 (usa PORT=5000 do .env)
+gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:$PORT server:app
+
+# Instância 2
+PORT=5001 gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:$PORT server:app
+```
+
+Liste todas as URLs no `SOCKET_SERVERS` do frontend.
 
 ---
 
