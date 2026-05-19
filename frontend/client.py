@@ -29,12 +29,29 @@ load_dotenv()
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
 
 # Lista de endereços backend: "host:porta,host:porta"
+# Remove esquemas (http:// / https://) caso presentes antes de fazer o parse.
+def _parse_servers(raw: str) -> list[tuple[str, int]]:
+    result = []
+    for s in raw.split(","):
+        s = s.strip()
+        if not s:
+            continue
+        # Remove esquema se existir
+        if "://" in s:
+            s = s.split("://", 1)[1]
+        # Remove trailing slashes
+        s = s.rstrip("/")
+        # Separa host e porta
+        if ":" in s:
+            host, port_str = s.rsplit(":", 1)
+            result.append((host, int(port_str)))
+        else:
+            # Sem porta explícita — usa 5000 como padrão
+            result.append((s, 5000))
+    return result
+
 _raw_servers = os.getenv("BACKEND_SERVERS", "localhost:5000")
-BACKEND_SERVERS: list[tuple[str, int]] = [
-    (s.split(":")[0], int(s.split(":")[1]))
-    for s in _raw_servers.split(",")
-    if s.strip()
-]
+BACKEND_SERVERS: list[tuple[str, int]] = _parse_servers(_raw_servers)
 
 PORT = int(os.getenv("PORT", 8000))
 
