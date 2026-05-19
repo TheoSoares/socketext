@@ -49,7 +49,12 @@ function tryConnect(index) {
   log('Tentando conectar: ' + url);
   postMessage({ event: 'status', state: 'connecting' });
 
-  socket = io(url, { timeout: 3000, reconnection: false });
+  socket = io(url, { 
+    timeout: 3000, 
+    reconnection: false,
+    transports: ['websocket'], // <--- FORÇA apenas WebSocket direto
+    upgrade: false             // <--- Bloqueia tentativa de HTTP Polling
+  });
 
   /* ── Conectou ── */
   socket.on('connect', function () {
