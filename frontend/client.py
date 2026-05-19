@@ -4,9 +4,9 @@ client.py — Frontend do SockeText.
 Responsabilidades:
   - Servir a interface web (HTML/JS) via Flask + Flask-SocketIO.
   - Manter uma conexão TCP separada com o backend para cada usuário conectado.
-  - Instanciar uma Thread dedicada à recepção de mensagens TCP por usuário (requisito).
-  - Retransmitir mensagens entre o browser (WebSocket) e o backend (TCP).
-  - Implementar fallback automático entre múltiplos servidores backend.
+  - Instanciar uma Thread dedicada à recepção de mensagens TCP por usuário.
+  - Retransmitir mensagens entre o browser (WebSocket/SocketIO) e o backend (TCP).
+  - Fallback automático entre múltiplos servidores backend (tryConnect).
 """
 
 import json
@@ -58,157 +58,134 @@ socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 # Registro de conexões: uma por usuário (sid do Socket.IO)
 # ---------------------------------------------------------------------------
 
-# Dicionário {sid: BackendConnection} — cada browser tem sua própria conexão TCP
 _connections: dict[str, "BackendConnection"] = {}
 _connections_lock = threading.Lock()
 
 
 def get_connection(sid: str) -> "BackendConnection | None":
-    """Retorna a conexão TCP associada a um sid, ou None se não existir."""
     with _connections_lock:
         return _connections.get(sid)
 
 
 def register_connection(sid: str, conn: "BackendConnection") -> None:
-    """Registra uma nova conexão TCP para o sid informado."""
     with _connections_lock:
         _connections[sid] = conn
 
 
 def remove_connection(sid: str) -> None:
-    """Remove e encerra a conexão TCP do sid informado."""
     with _connections_lock:
         conn = _connections.pop(sid, None)
     if conn:
         conn.disconnect()
-        log.info("Conexão TCP do sid '%s' encerrada.", sid)
 
 
 # ---------------------------------------------------------------------------
-# Gerenciador de conexão TCP com o backend (uma instância por usuário)
+# Gerenciador de conexão TCP com o backend
 # ---------------------------------------------------------------------------
 
 class BackendConnection:
     """
     Mantém a conexão TCP de UM usuário com o servidor backend.
 
-    Cada browser conectado gera uma instância independente desta classe,
-    garantindo que usuários distintos não compartilhem estado de conexão.
+    Implementa tryConnect: tenta cada servidor da lista em ordem,
+    e reconecta automaticamente do início se todos falharem.
     """
 
     def __init__(self, sid: str) -> None:
-        """
-        Args:
-            sid:  ID da sessão Socket.IO do browser deste usuário.
-                  Usado para emitir eventos de volta ao browser correto.
-        """
         self.sid = sid
         self._sock: socket.socket | None = None
-        self._send_lock = threading.Lock()      # Protege envios simultâneos
-        self._connected = threading.Event()     # Sinaliza quando a conexão está ativa
+        self._send_lock = threading.Lock()
+        self._connected = threading.Event()
         self._username: str = ""
+        self._alive = True          # False quando o usuário desconecta do browser
 
     # ------------------------------------------------------------------
-    # Conexão e reconexão
+    # tryConnect — tenta cada servidor em ordem, reinicia se esgotar
     # ------------------------------------------------------------------
 
-    def connect(self, username: str) -> bool:
+    def try_connect(self, username: str) -> None:
         """
-        Tenta conectar a um dos servidores backend disponíveis em ordem.
-
-        Envia o handshake de identificação ao conectar com sucesso e
-        inicia a thread dedicada à recepção de mensagens.
+        Tenta conectar a cada servidor backend em ordem.
+        Se todos falharem, aguarda 2s e reinicia a tentativa do início.
+        Roda em thread dedicada para não bloquear o handler SocketIO.
 
         Args:
-            username:  Nome do usuário (enviado no handshake).
-
-        Returns:
-            True se conectou com sucesso, False caso contrário.
+            username: Nome do usuário (enviado no handshake TCP).
         """
         self._username = username
 
-        for host, port in BACKEND_SERVERS:
-            try:
-                log.info("[%s] Tentando backend %s:%s...", username, host, port)
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5)
-                sock.connect((host, port))
-                sock.settimeout(None)
-
-                # Handshake: identifica o usuário para o servidor
-                handshake = json.dumps({"type": "join", "username": username}) + "\n"
-                sock.sendall(handshake.encode("utf-8"))
-
-                self._sock = sock
-                self._connected.set()
-                log.info("[%s] Conectado ao backend %s:%s.", username, host, port)
-
-                # Inicia thread dedicada à recepção (requisito)
-                self._start_receive_thread()
-                return True
-
-            except (OSError, ConnectionRefusedError) as e:
-                log.warning("[%s] Falha em %s:%s — %s", username, host, port, e)
-
-        log.error("[%s] Nenhum servidor backend disponível.", username)
-        return False
-
-    def reconnect(self) -> None:
-        """
-        Loop de reconexão com backoff exponencial.
-        Notifica o browser correto sobre o status da reconexão.
-        """
-        self._connected.clear()
-        delay = 2
-
-        while True:
-            log.info("[%s] Reconectando em %ss...", self._username, delay)
-            time.sleep(delay)
-
-            if self.connect(self._username):
-                # Emite apenas para o browser deste usuário (via sid)
-                socketio.emit("system", {"text": "Reconectado ao servidor."}, to=self.sid)
-                return
-
-            delay = min(delay * 2, 30)
-
-    # ------------------------------------------------------------------
-    # Thread dedicada à recepção (requisito explícito)
-    # ------------------------------------------------------------------
-
-    def _start_receive_thread(self) -> None:
-        """
-        Instancia e inicia a Thread dedicada à recepção de mensagens TCP.
-
-        Esta thread fica bloqueada em recv() aguardando dados do backend,
-        desacoplando completamente a recepção do envio.
-        """
-        t = threading.Thread(
-            target=self._receive_loop,
+        threading.Thread(
+            target=self._connect_loop,
             daemon=True,
-            name=f"tcp-recv-{self._username}-{self.sid[:8]}",
-        )
-        t.start()
-        log.info("Thread de recepção '%s' iniciada.", t.name)
+            name=f"tcp-connect-{username}-{self.sid[:8]}",
+        ).start()
+
+    def _connect_loop(self) -> None:
+        """Loop de tentativa de conexão — corre em thread separada."""
+        while self._alive:
+            for host, port in BACKEND_SERVERS:
+                if not self._alive:
+                    return
+
+                try:
+                    log.info("[%s] Tentando backend %s:%s...", self._username, host, port)
+
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(3)
+                    sock.connect((host, port))
+                    sock.settimeout(None)
+
+                    # Handshake
+                    handshake = json.dumps({"type": "join", "username": self._username}) + "\n"
+                    sock.sendall(handshake.encode("utf-8"))
+
+                    self._sock = sock
+                    self._connected.set()
+                    log.info("[%s] Conectado ao backend %s:%s.", self._username, host, port)
+
+                    # Bloqueia aqui até a conexão cair
+                    self._receive_loop()
+
+                    # Se chegou aqui, a conexão caiu — tenta o próximo servidor
+                    self._connected.clear()
+
+                    if not self._alive:
+                        return
+
+                    socketio.emit(
+                        "system",
+                        {"text": "Conexão perdida. Reconectando..."},
+                        to=self.sid,
+                    )
+
+                except (OSError, ConnectionRefusedError) as e:
+                    log.warning("[%s] Falha em %s:%s — %s", self._username, host, port, e)
+
+            if self._alive:
+                log.info("[%s] Todos os servidores falharam. Aguardando 2s...", self._username)
+                time.sleep(2)
+
+    # ------------------------------------------------------------------
+    # Thread dedicada à recepção
+    # ------------------------------------------------------------------
 
     def _receive_loop(self) -> None:
         """
-        Loop de recepção TCP — executa na thread dedicada deste usuário.
-
-        Lê mensagens do backend (delimitadas por newline), faz parse do JSON
-        e retransmite SOMENTE para o browser deste usuário via socketio.emit(..., to=sid).
+        Loop de recepção TCP — bloqueia até a conexão cair.
+        Retorna quando a conexão é encerrada (para que _connect_loop
+        possa tentar o próximo servidor).
         """
         buffer = ""
 
-        while True:
+        while self._alive:
             try:
                 chunk = self._sock.recv(4096).decode("utf-8")
                 if not chunk:
-                    raise ConnectionResetError("Servidor encerrou a conexão.")
+                    log.info("[%s] Servidor encerrou a conexão.", self._username)
+                    return
 
                 buffer += chunk
 
-                # Processa todas as mensagens completas no buffer
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
                     line = line.strip()
@@ -217,16 +194,9 @@ class BackendConnection:
 
                     self._dispatch(json.loads(line))
 
-            except (OSError, ConnectionResetError) as e:
+            except OSError as e:
                 log.error("[%s] Conexão TCP perdida: %s", self._username, e)
-                self._connected.clear()
-                socketio.emit(
-                    "system",
-                    {"text": "Conexão perdida. Reconectando..."},
-                    to=self.sid,
-                )
-                self.reconnect()
-                return  # Reconexão inicia nova thread
+                return
 
             except json.JSONDecodeError as e:
                 log.warning("[%s] Mensagem inválida do backend: %s", self._username, e)
@@ -234,12 +204,7 @@ class BackendConnection:
     def _dispatch(self, payload: dict) -> None:
         """
         Retransmite uma mensagem do backend para o browser DESTE usuário.
-
-        O `to=self.sid` garante que a mensagem vai apenas para o browser
-        correto, não para todos os conectados.
-
-        Args:
-            payload:  Dicionário com os dados recebidos do backend.
+        O `to=self.sid` garante entrega apenas ao browser correto.
         """
         msg_type = payload.get("type")
 
@@ -248,56 +213,49 @@ class BackendConnection:
 
         elif msg_type == "message":
             socketio.emit("message", {
-                "username": payload.get("username"),
-                "text":     payload.get("text"),
-                "sent_at":  payload.get("sent_at", ""),
+                "sender": payload.get("sender"),
+                "text":   payload.get("text"),
+                "time":   payload.get("time", ""),
             }, to=self.sid)
 
         elif msg_type == "system":
             socketio.emit("system", {"text": payload.get("text")}, to=self.sid)
 
         elif msg_type == "typing":
-            socketio.emit("typing", {
-                "username": payload.get("username"),
-                "typing":   payload.get("typing", False),
-            }, to=self.sid)
+            socketio.emit("typing", {"sender": payload.get("sender")}, to=self.sid)
+
+        elif msg_type == "stop_typing":
+            socketio.emit("stop_typing", {"sender": payload.get("sender")}, to=self.sid)
 
     # ------------------------------------------------------------------
     # Envio de mensagens
     # ------------------------------------------------------------------
 
     def send(self, payload: dict) -> bool:
-        """
-        Envia um payload JSON ao backend via TCP.
-
-        Args:
-            payload:  Dicionário a serializar e enviar.
-
-        Returns:
-            True se enviou com sucesso, False caso contrário.
-        """
+        """Envia um payload JSON ao backend via TCP."""
         if not self._connected.is_set() or self._sock is None:
             log.warning("[%s] Tentativa de envio sem conexão ativa.", self._username)
             return False
 
-        message = json.dumps(payload) + "\n"
+        message = (json.dumps(payload) + "\n").encode("utf-8")
         try:
             with self._send_lock:
-                self._sock.sendall(message.encode("utf-8"))
+                self._sock.sendall(message)
             return True
         except OSError as e:
             log.error("[%s] Erro ao enviar mensagem: %s", self._username, e)
             return False
 
     def disconnect(self) -> None:
-        """Encerra a conexão TCP com o backend."""
+        """Encerra a conexão TCP e para o loop de reconexão."""
+        self._alive = False
+        self._connected.clear()
         if self._sock:
             try:
                 self._sock.close()
             except OSError:
                 pass
             self._sock = None
-            self._connected.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +264,6 @@ class BackendConnection:
 
 @app.route("/", methods=["GET"])
 def index():
-    """Redireciona para o chat se logado, ou para login."""
     if "username" in session:
         return redirect(url_for("chat"))
     return redirect(url_for("login"))
@@ -314,19 +271,16 @@ def index():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    """Exibe e processa o formulário de login."""
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         if username:
             session["username"] = username
             return redirect(url_for("chat"))
-
     return render_template("login.html")
 
 
 @app.route("/chat")
 def chat():
-    """Exibe a interface principal do chat."""
     if "username" not in session:
         return redirect(url_for("login"))
     return render_template("chat.html", username=session["username"])
@@ -334,7 +288,6 @@ def chat():
 
 @app.route("/logout")
 def logout():
-    """Encerra a sessão."""
     session.clear()
     return redirect(url_for("login"))
 
@@ -345,40 +298,24 @@ def logout():
 
 @socketio.on("connect")
 def on_browser_connect():
-    """
-    Browser conectou via WebSocket.
-
-    Cria uma nova BackendConnection exclusiva para este usuário (identificada
-    pelo request.sid) e inicia a conexão TCP com o backend.
-    """
+    """Browser conectou — cria BackendConnection exclusiva e inicia tryConnect."""
     username = session.get("username")
     if not username:
-        return False  # Rejeita conexão sem sessão
+        return False
 
     sid = request.sid
 
-    # Garante que não há conexão duplicada para o mesmo sid
     if get_connection(sid) is not None:
-        log.info("[%s] sid '%s' já tem conexão ativa.", username, sid[:8])
         return
 
-    # Cria conexão TCP individual para este usuário
     conn = BackendConnection(sid)
     register_connection(sid, conn)
-
-    ok = conn.connect(username)
-    if not ok:
-        emit("system", {"text": "Erro: não foi possível conectar ao servidor."})
+    conn.try_connect(username)
 
 
 @socketio.on("send_message")
 def on_send_message(data: dict):
-    """
-    Browser enviou uma mensagem — repassa ao backend via TCP.
-
-    Args:
-        data:  Dicionário com chave 'text'.
-    """
+    """Browser enviou mensagem — repassa ao backend via TCP."""
     text = data.get("text", "").strip()
     if not text:
         return
@@ -389,27 +326,27 @@ def on_send_message(data: dict):
 
 
 @socketio.on("typing")
-def on_typing(data: dict):
-    """
-    Browser sinalizou estado de digitação — repassa ao backend.
-
-    Args:
-        data:  Dicionário com chave 'typing' (bool).
-    """
+def on_typing():
+    """Browser sinalizou que está digitando."""
     conn = get_connection(request.sid)
     if conn:
-        conn.send({"type": "typing", "typing": data.get("typing", False)})
+        conn.send({"type": "typing"})
+
+
+@socketio.on("stop_typing")
+def on_stop_typing():
+    """Browser sinalizou que parou de digitar."""
+    conn = get_connection(request.sid)
+    if conn:
+        conn.send({"type": "stop_typing"})
 
 
 @socketio.on("disconnect")
 def on_browser_disconnect():
-    """
-    Browser desconectou — remove e encerra a conexão TCP deste usuário.
-    """
-    sid = request.sid
-    username = session.get("username", sid[:8])
-    log.info("[%s] Browser desconectou. Encerrando conexão TCP.", username)
-    remove_connection(sid)
+    """Browser desconectou — encerra a conexão TCP deste usuário."""
+    username = session.get("username", request.sid[:8])
+    log.info("[%s] Browser desconectou.", username)
+    remove_connection(request.sid)
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # ★ SockeText
 
-Chat em tempo real com suporte a múltiplos usuários, histórico persistente e tolerância a falhas.
+Chat em tempo real com suporte a múltiplos usuários, histórico persistente e failover automático entre servidores.
 
 ## Arquitetura
 
@@ -8,16 +8,19 @@ Chat em tempo real com suporte a múltiplos usuários, histórico persistente e 
 [Browser]
     │  WebSocket (Socket.IO)
     ▼
-[Frontend — Flask + SocketIO]     porta 8000
+[Frontend — Flask + SocketIO]        porta 8000
     │  TCP socket (cliente manual)
-    │  Thread de recepção dedicada  ← requisito
+    │  Thread de recepção dedicada   ← requisito
+    │  tryConnect: fallback automático entre servidores
     ▼
-[Backend — TCP Server]
-    ├── Primário  (porta 5000)  ← Thread por conexão de cliente
-    └── Réplica   (porta 5001)  ← assume se o primário cair
-            │
-        PostgreSQL  (histórico de mensagens)
-        Redis       (heartbeat de replicação)
+[Backend A — TCP Server]   [Backend B — TCP Server]
+    porta 5000                   porta 5000
+    host-1                       host-2
+         │                            │
+         └──────────┬─────────────────┘
+                    ▼
+              PostgreSQL
+          (histórico de mensagens)
 ```
 
 ### Por que essa arquitetura atende os requisitos
@@ -25,9 +28,9 @@ Chat em tempo real com suporte a múltiplos usuários, histórico persistente e 
 | Requisito | Implementação |
 |---|---|
 | Thread por conexão no servidor | `backend/server.py` — `threading.Thread` instanciada em `accept_loop()` para cada frontend conectado |
-| Thread de recepção no cliente | `frontend/client.py` — `BackendConnection._start_receive_thread()` cria thread dedicada que fica bloqueada em `recv()` |
+| Thread de recepção no cliente | `frontend/client.py` — `BackendConnection._receive_loop()` roda em thread dedicada bloqueada em `recv()` |
+| Tolerância a falhas | `frontend/client.py` — `tryConnect` tenta cada servidor da lista em ordem; se todos falharem, aguarda 2s e reinicia |
 | Interface web | Flask serve HTML/CSS/JS; browser usa Socket.IO |
-| Tolerância a falhas | `backend/replication.py` — primário publica heartbeat no Redis; réplica monitora e executa failover |
 
 ---
 
@@ -36,13 +39,11 @@ Chat em tempo real com suporte a múltiplos usuários, histórico persistente e 
 ```
 socketext/
 ├── backend/
-│   ├── server.py          # Servidor TCP: aceita conexões, threads por cliente, broadcast
-│   ├── db.py              # Camada PostgreSQL: salvar e carregar histórico
-│   ├── replication.py     # Replicação: heartbeat Redis, failover automático
+│   ├── server.py          # Servidor TCP: aceita conexões, threads por cliente, broadcast, PostgreSQL
 │   ├── requirements.txt
 │   └── .env.example
 ├── frontend/
-│   ├── client.py          # Flask HTTP + cliente TCP com thread de recepção
+│   ├── client.py          # Flask HTTP + cliente TCP com thread de recepção e tryConnect
 │   ├── requirements.txt
 │   ├── .env.example
 │   ├── templates/
@@ -99,19 +100,22 @@ cd ../frontend && pip install -r requirements.txt
 
 ## Executando
 
-### Servidor primário
+### Servidor A (host-1)
 
 ```bash
 cd backend
-ROLE=primary PORT=5000 python server.py
+PORT=5000 python server.py
 ```
 
-### Servidor réplica
+### Servidor B (host-2)
 
 ```bash
 cd backend
-ROLE=replica PORT=5001 python server.py
+PORT=5000 python server.py
 ```
+
+> Ambos os servidores são idênticos e independentes — não há primário nem réplica.  
+> Cada um persiste mensagens no mesmo banco PostgreSQL compartilhado.
 
 ### Frontend
 
@@ -124,12 +128,17 @@ Acesse **http://localhost:8000**, digite seu nome e comece a conversar.
 
 ---
 
-## Como funciona a replicação
+## Como funciona o failover
 
-1. O servidor **primário** publica um timestamp no Redis a cada `HEARTBEAT_INTERVAL` segundos (padrão: 2s).
-2. O servidor **réplica** monitora essa chave. Se ela não for atualizada por `FAILOVER_TIMEOUT` segundos (padrão: 6s), executa o failover.
-3. No failover, a réplica abre um novo socket TCP na porta do primário e passa a aceitar conexões, tornando-se o novo primário.
-4. O frontend tenta os servidores em ordem (`BACKEND_SERVERS`); se o primeiro cair, reconecta automaticamente ao próximo.
+O frontend mantém uma lista ordenada de servidores backend em `BACKEND_SERVERS`.  
+Ao conectar (ou reconectar após queda), o `tryConnect` percorre a lista em ordem:
+
+1. Tenta o primeiro servidor com timeout de 3s.
+2. Se conectar, envia o handshake e inicia a thread de recepção.
+3. Se a conexão cair, tenta o próximo servidor da lista.
+4. Se esgotar a lista sem sucesso, aguarda 2s e reinicia do início.
+
+O browser recebe uma notificação via Socket.IO em cada mudança de estado, e o histórico é recarregado automaticamente ao reconectar.
 
 ---
 
@@ -139,24 +148,25 @@ Acesse **http://localhost:8000**, digite seu nome e comece a conversar.
 
 | Variável | Descrição | Padrão |
 |---|---|---|
-| `ROLE` | `primary` ou `replica` | `primary` |
-| `PORT` | Porta TCP deste servidor | `5000` |
-| `PRIMARY_PORT` | Porta do primário (usada no failover) | `5000` |
+| `PORT` | Porta TCP do servidor | `5000` |
 | `INTERNAL_DATABASE_URL` | PostgreSQL em produção | — |
-| `EXTERNAL_DATABASE_URL` | PostgreSQL em debug | — |
-| `DEBUG` | `true` usa URL externa | `false` |
-| `REDIS_URL` | URL de conexão Redis | `redis://localhost:6379` |
-| `HISTORY_LIMIT` | Mensagens no histórico inicial | `50` |
-| `HEARTBEAT_INTERVAL` | Segundos entre heartbeats | `2` |
-| `FAILOVER_TIMEOUT` | Timeout para failover | `6` |
+| `EXTERNAL_DATABASE_URL` | PostgreSQL em debug local | — |
+| `DEBUG` | `true` usa a URL externa | `false` |
+| `HISTORY_LIMIT` | Número de mensagens no histórico inicial | `50` |
+| `SECRET_KEY` | Chave secreta (usada pelo Flask no frontend) | — |
 
 ### `frontend/.env`
 
 | Variável | Descrição | Padrão |
 |---|---|---|
 | `SECRET_KEY` | Chave secreta Flask | — |
-| `BACKEND_SERVERS` | `host:porta` separados por vírgula | `localhost:5000` |
+| `BACKEND_SERVERS` | Endereços TCP separados por vírgula | `localhost:5000` |
 | `PORT` | Porta HTTP do frontend | `8000` |
+
+**Exemplo com dois servidores:**
+```env
+BACKEND_SERVERS=host-1.exemplo.com:5000,host-2.exemplo.com:5000
+```
 
 ---
 
@@ -171,17 +181,23 @@ Todas as mensagens são JSON delimitadas por `\n`.
 
 ### Histórico (backend → frontend, logo após handshake)
 ```json
-{"type": "history", "messages": [{"username": "...", "text": "...", "sent_at": "..."}]}
+{
+  "type": "history",
+  "messages": [
+    {"sender": "Alice", "text": "Olá!", "time": "14:32"}
+  ]
+}
 ```
 
 ### Mensagem (bidirecional)
 ```json
-{"type": "message", "username": "Alice", "text": "Olá!"}
+{"type": "message", "sender": "Alice", "text": "Olá!"}
 ```
 
 ### Digitando (frontend → backend → outros frontends)
 ```json
-{"type": "typing", "username": "Alice", "typing": true}
+{"type": "typing"}
+{"type": "stop_typing"}
 ```
 
 ### Sistema (backend → frontend)

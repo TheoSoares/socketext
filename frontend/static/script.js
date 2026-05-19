@@ -1,11 +1,11 @@
 /**
  * script.js — Lógica do cliente web do SockeText.
  *
- * Responsabilidades:
- *   - Conectar ao frontend Flask via Socket.IO.
- *   - Enviar mensagens e sinalizar digitação.
- *   - Renderizar mensagens, histórico e notificações do sistema.
- *   - Gerenciar indicador de "digitando...".
+ * Conecta ao frontend Flask via Socket.IO e gerencia:
+ *   - Renderização de mensagens e histórico
+ *   - Indicador de digitação
+ *   - Notificações de sistema
+ *   - Envio de mensagens e sinalização de digitação
  */
 
 "use strict";
@@ -34,6 +34,23 @@ const typingUsers = new Set();
 
 /** Timer para parar de sinalizar "digitando" após inatividade */
 let typingTimer = null;
+let isTyping = false;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function escapeHtml(str) {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function scrollToBottom() {
+  messagesList.scrollTop = messagesList.scrollHeight;
+}
 
 // ---------------------------------------------------------------------------
 // Renderização
@@ -42,23 +59,24 @@ let typingTimer = null;
 /**
  * Cria e insere uma bolha de mensagem na lista.
  *
- * @param {string} username
+ * @param {string} sender
  * @param {string} text
- * @param {string} [sentAt]   - Timestamp ISO opcional.
- * @param {boolean} [isOwn]   - True se é mensagem do próprio usuário.
+ * @param {string} [time]    - Horário formatado (HH:MM).
+ * @param {boolean} [isOwn]  - True se é mensagem do próprio usuário.
  */
-function appendMessage(username, text, sentAt = "", isOwn = false) {
-  const time = sentAt
-    ? new Date(sentAt).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })
-    : new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+function appendMessage(sender, text, time = "", isOwn = false) {
+  const displayTime = time || new Date().toLocaleTimeString("pt-BR", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 
   const item = document.createElement("div");
   item.classList.add("msg", isOwn ? "msg--own" : "msg--other");
 
   item.innerHTML = `
     <div class="msg__header">
-      <span class="msg__user">${escapeHtml(username)}</span>
-      <span class="msg__time">${time}</span>
+      <span class="msg__user">${escapeHtml(sender)}</span>
+      <span class="msg__time">${displayTime}</span>
     </div>
     <div class="msg__bubble">${escapeHtml(text)}</div>
   `;
@@ -80,30 +98,10 @@ function appendSystemMessage(text) {
   scrollToBottom();
 }
 
-/** Rola a lista para o final. */
-function scrollToBottom() {
-  messagesList.scrollTop = messagesList.scrollHeight;
-}
-
-/**
- * Escapa caracteres HTML para evitar XSS.
- *
- * @param {string} str
- * @returns {string}
- */
-function escapeHtml(str) {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
 // ---------------------------------------------------------------------------
 // Indicador de digitação
 // ---------------------------------------------------------------------------
 
-/** Atualiza o texto do indicador com base em typingUsers. */
 function updateTypingIndicator() {
   const users = [...typingUsers].filter(u => u !== window.CURRENT_USER);
 
@@ -125,14 +123,15 @@ function updateTypingIndicator() {
 // ---------------------------------------------------------------------------
 
 socket.on("history", ({ messages }) => {
-  messages.forEach(({ username, text, sent_at }) => {
-    appendMessage(username, text, sent_at, username === window.CURRENT_USER);
+  messages.forEach(({ sender, text, time }) => {
+    appendMessage(sender, text, time, sender === window.CURRENT_USER);
   });
 });
 
-socket.on("message", ({ username, text, sent_at }) => {
-  appendMessage(username, text, sent_at, username === window.CURRENT_USER);
-  typingUsers.delete(username);
+socket.on("message", ({ sender, text, time }) => {
+  appendMessage(sender, text, time, sender === window.CURRENT_USER);
+  // Remove do indicador de digitação caso estivesse lá
+  typingUsers.delete(sender);
   updateTypingIndicator();
 });
 
@@ -140,12 +139,13 @@ socket.on("system", ({ text }) => {
   appendSystemMessage(text);
 });
 
-socket.on("typing", ({ username, typing }) => {
-  if (typing) {
-    typingUsers.add(username);
-  } else {
-    typingUsers.delete(username);
-  }
+socket.on("typing", ({ sender }) => {
+  typingUsers.add(sender);
+  updateTypingIndicator();
+});
+
+socket.on("stop_typing", ({ sender }) => {
+  typingUsers.delete(sender);
   updateTypingIndicator();
 });
 
@@ -157,11 +157,16 @@ function sendMessage() {
   const text = messageInput.value.trim();
   if (!text) return;
 
+  // Cancela sinalização de digitação antes de enviar
+  if (isTyping) {
+    clearTimeout(typingTimer);
+    typingTimer = null;
+    isTyping = false;
+    socket.emit("stop_typing");
+  }
+
   socket.emit("send_message", { text });
   messageInput.value = "";
-
-  clearTimeout(typingTimer);
-  socket.emit("typing", { typing: false });
 }
 
 sendBtn.addEventListener("click", sendMessage);
@@ -178,9 +183,14 @@ messageInput.addEventListener("keydown", (e) => {
 // ---------------------------------------------------------------------------
 
 messageInput.addEventListener("input", () => {
-  socket.emit("typing", { typing: true });
+  if (!isTyping) {
+    isTyping = true;
+    socket.emit("typing");
+  }
+
   clearTimeout(typingTimer);
   typingTimer = setTimeout(() => {
-    socket.emit("typing", { typing: false });
+    isTyping = false;
+    socket.emit("stop_typing");
   }, 2000);
 });
